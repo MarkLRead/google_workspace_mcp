@@ -85,7 +85,7 @@ def test_configure_server_for_http_uses_protocol_auth_required_scopes(monkeypatc
             self._cimd_manager = SimpleNamespace(default_scope=default_scope)
 
     monkeypatch.setattr(server_module, "get_transport_mode", lambda: "streamable-http")
-    monkeypatch.setattr(server_module, "GoogleProvider", FakeGoogleProvider)
+    monkeypatch.setattr(server_module, "AllowlistGoogleProvider", FakeGoogleProvider)
     monkeypatch.setattr(
         server_module,
         "get_current_scopes",
@@ -214,7 +214,7 @@ def test_configure_server_for_http_accepts_client_secret_from_file(
             self.client_registration_options = None
 
     monkeypatch.setattr(server_module, "get_transport_mode", lambda: "streamable-http")
-    monkeypatch.setattr(server_module, "GoogleProvider", FakeGoogleProvider)
+    monkeypatch.setattr(server_module, "AllowlistGoogleProvider", FakeGoogleProvider)
     monkeypatch.setattr(
         server_module,
         "get_current_scopes",

@@ -13,6 +13,12 @@ from core.warning_filters import install_startup_warning_filters
 install_startup_warning_filters()
 
 from auth.auth_info_middleware import AuthInfoMiddleware
+from auth.email_allowlist import (
+    ALLOWED_EMAILS_ENV,
+    AllowlistGoogleProvider,
+    IdentityDenied,
+    load_allowed_emails,
+)
 from core.camel_case_middleware import CamelCaseArgumentsMiddleware
 from auth.google_auth import handle_auth_callback, start_auth_flow, check_client_secrets
 from auth.gateway_identity import get_verified_gateway_principal
@@ -729,7 +735,19 @@ def configure_server_for_http():
                         "OAuth 2.1: restricting DCR client redirect URIs to allowlist: %s",
                         allowed_client_redirect_uris,
                     )
-                provider = GoogleProvider(
+                # Verified-identity gate. A set-but-unusable allowlist raises here
+                # and stops start-up. An absent allowlist starts the server with
+                # the gate closed to everyone: on a multi-user HTTP deployment
+                # "not configured yet" must not mean "open to any Google account".
+                allowed_emails = load_allowed_emails()
+                if allowed_emails is None:
+                    allowed_emails = frozenset()
+                    logger.warning(
+                        "OAuth 2.1: %s is not set; every sign-in will be denied "
+                        "until it lists at least one address.",
+                        ALLOWED_EMAILS_ENV,
+                    )
+                provider = AllowlistGoogleProvider(
                     client_id=config.client_id,
                     client_secret=config.client_secret,
                     base_url=config.get_oauth_base_url(),
@@ -739,6 +757,7 @@ def configure_server_for_http():
                     client_storage=client_storage,
                     jwt_signing_key=jwt_signing_key,
                     allowed_client_redirect_uris=allowed_client_redirect_uris,
+                    allowed_emails=allowed_emails,
                     **expiry_kwargs,
                 )
                 if provider.client_registration_options is not None:
@@ -886,6 +905,10 @@ async def legacy_oauth2_callback(request: Request) -> HTMLResponse:
         )
 
         return create_success_response(verified_user_id)
+    except IdentityDenied as e:
+        # Explicit denial, not a generic server error. handle_auth_callback
+        # raised before storing anything and has already logged "denied".
+        return create_error_response(str(e), status_code=403)
     except Exception as e:
         logger.error(f"Error processing OAuth callback: {str(e)}", exc_info=True)
         return create_server_error_response(str(e))

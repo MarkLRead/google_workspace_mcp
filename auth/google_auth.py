@@ -22,6 +22,7 @@ from auth.scopes import SCOPES, get_current_scopes, has_required_scopes  # noqa
 from auth.client_secrets import get_client_secrets_path, load_client_secrets_file
 from auth.oauth21_session_store import get_oauth21_session_store
 from auth.credential_store import get_credential_store
+from auth.email_allowlist import enforce_allowed_email, load_allowed_emails
 from auth.gateway_identity import normalize_principal_email
 from auth.oauth_config import (
     is_oauth21_enabled,
@@ -801,6 +802,9 @@ async def handle_auth_callback(
             raise ValueError("Failed to get user email for identification.")
 
         user_google_email = user_info["email"]
+        # Identity gate first: a rejected address is never logged, and nothing
+        # below (credential store, session store) runs for a denied identity.
+        enforce_allowed_email(user_google_email, load_allowed_emails())
         logger.info(f"Identified user_google_email: {user_google_email}")
 
         enforcement_marker = state_info.get("enforce_user_email_match")

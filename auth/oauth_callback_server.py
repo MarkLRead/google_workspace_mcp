@@ -27,6 +27,7 @@ from auth.oauth_responses import (
     create_success_response,
     create_server_error_response,
 )
+from auth.email_allowlist import IdentityDenied
 from auth.google_auth import handle_auth_callback, check_client_secrets
 from auth.oauth_config import (
     get_oauth_redirect_uri,
@@ -110,6 +111,9 @@ class MinimalOAuthServer:
                 # Return success page using shared template
                 return create_success_response(verified_user_id)
 
+            except IdentityDenied as e:
+                # Explicit denial; nothing was stored and "denied" is already logged.
+                return create_error_response(str(e), status_code=403)
             except Exception as e:
                 error_message_detail = f"Error processing OAuth callback: {str(e)}"
                 logger.error(error_message_detail, exc_info=True)
