@@ -20,6 +20,7 @@ from auth.email_allowlist import (
     load_allowed_emails,
 )
 from core.camel_case_middleware import CamelCaseArgumentsMiddleware
+from core.disabled_actions import DisabledActionsMiddleware, load_disabled_actions
 from auth.google_auth import handle_auth_callback, start_auth_flow, check_client_secrets
 from auth.gateway_identity import get_verified_gateway_principal
 from auth.mcp_session_middleware import MCPSessionMiddleware
@@ -378,6 +379,10 @@ server.add_middleware(auth_info_middleware)
 # parameters. See https://github.com/taylorwilsdon/google_workspace_mcp/issues/918
 server.add_middleware(CamelCaseArgumentsMiddleware())
 
+# Refuse configured actions of compound tools (e.g. manage_event:delete).
+# A malformed WORKSPACE_MCP_DISABLED_ACTIONS raises here and stops start-up.
+server.add_middleware(DisabledActionsMiddleware(load_disabled_actions()))
+
 
 def _parse_allowed_redirect_uris(value: Optional[str]) -> Optional[List[str]]:
     """Parse a comma-separated list of OAuth client redirect URIs.
@@ -403,6 +408,38 @@ def set_transport_mode(mode: str):
     _set_transport_mode(mode)
     # Debug level: the startup banner already shows the active transport.
     logger.debug(f"Transport: {mode}")
+
+
+def _refuse_ungated_external_provider() -> None:
+    """This fork admits identities only through the email allowlist.
+
+    EXTERNAL_OAUTH21_PROVIDER accepts bearer tokens minted elsewhere and has no
+    allowlist check, so it must not start.
+    """
+    raise RuntimeError(
+        "EXTERNAL_OAUTH21_PROVIDER is not supported in this build: that mode is not "
+        f"covered by the {ALLOWED_EMAILS_ENV} identity gate."
+    )
+
+
+def _refuse_ungated_identity_sources(config) -> None:
+    """Over HTTP, identity may come only from the allowlisted Google sign-in.
+
+    Trusted-gateway assertions and service-account delegation both pick the
+    Google account without passing the allowlist.
+    """
+    service_account = getattr(config, "is_service_account_enabled", None)
+
+    if getattr(config, "trust_gateway_identity", False):
+        raise RuntimeError(
+            "MCP_TRUST_GATEWAY_IDENTITY is not supported in this build: it is not "
+            f"covered by the {ALLOWED_EMAILS_ENV} identity gate."
+        )
+    if callable(service_account) and service_account():
+        raise RuntimeError(
+            "Service-account delegation is not supported in this build: it is not "
+            f"covered by the {ALLOWED_EMAILS_ENV} identity gate."
+        )
 
 
 def _ensure_legacy_callback_route() -> None:
@@ -434,6 +471,7 @@ def configure_server_for_http():
     oauth21_enabled = config.is_oauth21_enabled()
 
     if oauth21_enabled:
+        _refuse_ungated_identity_sources(config)
         if not config.is_configured():
             raise RuntimeError(
                 "streamable-http transport requires GOOGLE_OAUTH_CLIENT_ID so OAuth 2.1 "
@@ -703,6 +741,7 @@ def configure_server_for_http():
 
             # Check if external OAuth provider is configured
             if config.is_external_oauth21_provider():
+                _refuse_ungated_external_provider()
                 # External OAuth mode: use custom provider that handles ya29.* access tokens
                 from auth.external_oauth_provider import ExternalOAuthProvider
 
@@ -740,8 +779,7 @@ def configure_server_for_http():
                 # the gate closed to everyone: on a multi-user HTTP deployment
                 # "not configured yet" must not mean "open to any Google account".
                 allowed_emails = load_allowed_emails()
-                if allowed_emails is None:
-                    allowed_emails = frozenset()
+                if not allowed_emails:
                     logger.warning(
                         "OAuth 2.1: %s is not set; every sign-in will be denied "
                         "until it lists at least one address.",

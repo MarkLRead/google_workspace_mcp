@@ -13,12 +13,16 @@ enforced on both authentication paths:
 
 Rules this module keeps:
 
+* Deny by default, on every path. An absent variable is an empty allowlist:
+  the server starts and admits no one. There is no "no gate" value.
 * A value that is set but parses to nothing (whitespace, stray commas) or holds
   an entry that is not an email address is a configuration error and stops the
-  server at start-up. It never silently means "everyone" or "no one".
+  server at start-up.
 * A rejected email address is never logged; the log line says "denied" only.
 * A denial is explicit (HTTP 403 with a plain message), never a generic
-  server error.
+  server error. Denial is local: the Google grant is not revoked, because the
+  same grant may back a legitimate session and a verifier failure can be
+  transient. Revocation is an operator action.
 """
 
 from __future__ import annotations
@@ -28,7 +32,6 @@ import logging
 import os
 from typing import Any, FrozenSet, Optional
 
-import httpx
 from fastmcp.server.auth import AccessToken, TokenVerifier
 from fastmcp.server.auth.providers.google import GoogleProvider
 from starlette.requests import Request
@@ -38,7 +41,6 @@ logger = logging.getLogger(__name__)
 
 ALLOWED_EMAILS_ENV = "WORKSPACE_MCP_ALLOWED_EMAILS"
 DENIAL_MESSAGE = "Access denied: this account is not authorized to use this server."
-GOOGLE_REVOKE_URL = "https://oauth2.googleapis.com/revoke"
 
 
 class AllowlistConfigError(ValueError):
@@ -55,15 +57,15 @@ class IdentityDenied(PermissionError):
         super().__init__(DENIAL_MESSAGE)
 
 
-def parse_allowed_emails(raw: Optional[str]) -> Optional[FrozenSet[str]]:
+def parse_allowed_emails(raw: Optional[str]) -> FrozenSet[str]:
     """Parse the allowlist value.
 
-    Returns None when the variable is absent (``raw is None``). Raises
-    AllowlistConfigError when it is present but empty, all whitespace, only
-    separators, or contains an entry that is not an email address.
+    Absent (``raw is None``) is the empty allowlist: nobody is admitted. Raises
+    AllowlistConfigError when the value is present but empty, all whitespace,
+    only separators, or contains an entry that is not an email address.
     """
     if raw is None:
-        return None
+        return frozenset()
     entries = [e.strip().lower() for e in raw.split(",")]
     emails = [e for e in entries if e]
     if not emails:
@@ -81,15 +83,15 @@ def parse_allowed_emails(raw: Optional[str]) -> Optional[FrozenSet[str]]:
     return frozenset(emails)
 
 
-def load_allowed_emails() -> Optional[FrozenSet[str]]:
+def load_allowed_emails() -> FrozenSet[str]:
     """Read and validate the allowlist from the environment."""
     return parse_allowed_emails(os.environ.get(ALLOWED_EMAILS_ENV))
 
 
 def is_email_allowed(email: Optional[str], allowed: Optional[FrozenSet[str]]) -> bool:
-    """True when ``email`` may use the server. ``allowed is None`` means no gate."""
-    if allowed is None:
-        return True
+    """True only when ``email`` is on ``allowed``. No allowlist admits no one."""
+    if not allowed:
+        return False
     if not email or not isinstance(email, str):
         return False
     return email.strip().lower() in allowed
@@ -111,20 +113,33 @@ def _claim_is_true(value: Any) -> bool:
 
 
 class AllowlistTokenVerifier(TokenVerifier):
-    """Wraps a TokenVerifier; a verified token for a non-allowed email is invalid."""
+    """Wraps a TokenVerifier; only a verified, allowed identity stays valid.
 
-    def __init__(self, inner: TokenVerifier, allowed: FrozenSet[str]) -> None:
+    On top of the inner verifier's checks a token must carry a ``sub``, an
+    ``aud`` equal to this server's Google client id, ``email_verified`` true and
+    an ``email`` on the allowlist.
+    """
+
+    def __init__(
+        self, inner: TokenVerifier, allowed: FrozenSet[str], expected_client_id: str
+    ) -> None:
+        if not expected_client_id:
+            raise ValueError("expected_client_id is required")
         super().__init__(required_scopes=inner.required_scopes)
         self._inner = inner
         self._allowed = allowed
+        self._expected_client_id = expected_client_id
 
     async def verify_token(self, token: str) -> Optional[AccessToken]:
         validated = await self._inner.verify_token(token)
         if validated is None:
             return None
         claims = getattr(validated, "claims", None) or {}
-        if not _claim_is_true(claims.get("email_verified")) or not is_email_allowed(
-            claims.get("email"), self._allowed
+        if (
+            not claims.get("sub")
+            or claims.get("aud") != self._expected_client_id
+            or not _claim_is_true(claims.get("email_verified"))
+            or not is_email_allowed(claims.get("email"), self._allowed)
         ):
             logger.warning("Token denied: identity not in %s", ALLOWED_EMAILS_ENV)
             return None
@@ -144,8 +159,9 @@ class _GatedCodeStore:
     """Proxy for OAuthProxy's authorization-code store.
 
     ``put`` is the single point where the proxy turns Google's tokens into an
-    MCP authorization code. The identity is checked there, so a denied sign-in
-    stores nothing and is issued nothing.
+    MCP authorization code (every later token the proxy mints is redeemed from
+    such a code). The identity is checked there, so a denied sign-in gets no
+    code and its Google tokens are dropped, never persisted.
     """
 
     def __init__(self, inner: Any, verifier: AllowlistTokenVerifier) -> None:
@@ -163,7 +179,6 @@ class _GatedCodeStore:
             flag = _callback_denied.get()
             if flag is not None:
                 flag["denied"] = True
-            await _revoke_google_token(idp_tokens.get("refresh_token") or access_token)
             raise IdentityDenied()
         return await self._inner.put(*args, **kwargs)
 
@@ -171,23 +186,12 @@ class _GatedCodeStore:
         return getattr(self.__dict__["_inner"], name)
 
 
-async def _revoke_google_token(token: Optional[str]) -> None:
-    """Best effort: do not leave a grant behind for an identity we refused."""
-    if not token:
-        return
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            await client.post(GOOGLE_REVOKE_URL, data={"token": token})
-    except Exception:
-        logger.warning("Could not revoke the Google grant of a denied sign-in")
-
-
 def _denied_response() -> HTMLResponse:
     html = (
         "<!doctype html><html><head><meta charset='utf-8'>"
         "<title>Access denied</title></head><body>"
         f"<h1>Access denied</h1><p>{DENIAL_MESSAGE}</p>"
-        "<p>Nothing was stored. You can close this window.</p></body></html>"
+        "<p>Authorization was denied. You can close this window.</p></body></html>"
     )
     return HTMLResponse(
         content=html, status_code=403, headers={"Cache-Control": "no-store"}
@@ -206,7 +210,11 @@ class AllowlistGoogleProvider(GoogleProvider):
                 "FastMCP OAuthProxy internals changed; the email allowlist cannot be "
                 "attached. Pin fastmcp to the tested version."
             )
-        gated = AllowlistTokenVerifier(self._token_validator, allowed_emails)
+        gated = AllowlistTokenVerifier(
+            self._token_validator,
+            frozenset(allowed_emails),
+            expected_client_id=kwargs.get("client_id") or "",
+        )
         self._token_validator = gated
         self._code_store = _GatedCodeStore(self._code_store, gated)
 
