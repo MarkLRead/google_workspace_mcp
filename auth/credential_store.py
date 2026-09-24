@@ -9,6 +9,8 @@ import json
 import logging
 import os
 import re
+
+from auth.log_redaction import redact_email, redact_text
 from abc import ABC, abstractmethod
 from datetime import datetime
 from typing import List, Optional
@@ -195,7 +197,10 @@ class LocalDirectoryCredentialStore(CredentialStore):
                     if expiry.tzinfo is not None:
                         expiry = expiry.replace(tzinfo=None)
                 except (ValueError, TypeError) as e:
-                    logger.warning(f"Could not parse expiry time for {user_email}: {e}")
+                    logger.warning(
+                        f"Could not parse expiry time for {redact_email(user_email)}: "
+                        f"{redact_text(e)}"
+                    )
 
             credentials = Credentials(
                 token=creds_data.get("token"),
@@ -212,7 +217,8 @@ class LocalDirectoryCredentialStore(CredentialStore):
 
         except (IOError, json.JSONDecodeError, KeyError) as e:
             logger.error(
-                f"Error loading credentials for {user_email} from {creds_path}: {e}"
+                f"Error loading credentials for {redact_email(user_email)} from "
+                f"{redact_text(creds_path)}: {redact_text(e)}"
             )
             return None
 
@@ -238,7 +244,8 @@ class LocalDirectoryCredentialStore(CredentialStore):
             return True
         except IOError as e:
             logger.error(
-                f"Error storing credentials for {user_email} to {creds_path}: {e}"
+                f"Error storing credentials for {redact_email(user_email)} to "
+                f"{redact_text(creds_path)}: {redact_text(e)}"
             )
             return False
 
@@ -258,7 +265,8 @@ class LocalDirectoryCredentialStore(CredentialStore):
                 return True  # Consider it a success if file doesn't exist
         except IOError as e:
             logger.error(
-                f"Error deleting credentials for {user_email} from {creds_path}: {e}"
+                f"Error deleting credentials for {redact_email(user_email)} from "
+                f"{redact_text(creds_path)}: {redact_text(e)}"
             )
             return False
 
@@ -403,13 +411,17 @@ class GCSCredentialStore(CredentialStore):
             logger.debug(f"No credentials object for {user_email}")
             return None
         except Exception as e:
-            logger.error(f"Error downloading credentials for {user_email}: {e}")
+            logger.error(
+                f"Error downloading credentials for {redact_email(user_email)}: {redact_text(e)}"
+            )
             raise
 
         try:
             creds_data = json.loads(raw)
         except json.JSONDecodeError as e:
-            logger.error(f"Error parsing credentials for {user_email}: {e}")
+            logger.error(
+                f"Error parsing credentials for {redact_email(user_email)}: {redact_text(e)}"
+            )
             return None
 
         expiry = None
@@ -419,7 +431,9 @@ class GCSCredentialStore(CredentialStore):
                 if expiry.tzinfo is not None:
                     expiry = expiry.replace(tzinfo=None)
             except (ValueError, TypeError) as e:
-                logger.warning(f"Could not parse expiry for {user_email}: {e}")
+                logger.warning(
+                    f"Could not parse expiry for {redact_email(user_email)}: {redact_text(e)}"
+                )
 
         return Credentials(
             token=creds_data.get("token"),
@@ -469,12 +483,14 @@ class GCSCredentialStore(CredentialStore):
             return True
         except self._PreconditionFailed:
             logger.warning(
-                f"Concurrent write detected for {user_email}; "
+                f"Concurrent write detected for {redact_email(user_email)}; "
                 f"abandoning this write so next refresh can merge current state"
             )
             return False
         except Exception as e:
-            logger.error(f"Error storing credentials for {user_email}: {e}")
+            logger.error(
+                f"Error storing credentials for {redact_email(user_email)}: {redact_text(e)}"
+            )
             return False
 
     def delete_credential(self, user_email: str) -> bool:
@@ -487,7 +503,9 @@ class GCSCredentialStore(CredentialStore):
         except self._NotFound:
             return True
         except Exception as e:
-            logger.error(f"Error deleting credentials for {user_email}: {e}")
+            logger.error(
+                f"Error deleting credentials for {redact_email(user_email)}: {redact_text(e)}"
+            )
             return False
 
     def list_users(self) -> List[str]:

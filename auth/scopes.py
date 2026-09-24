@@ -68,6 +68,13 @@ TASKS_READONLY_SCOPE = "https://www.googleapis.com/auth/tasks.readonly"
 # Google Contacts (People API) scopes
 CONTACTS_SCOPE = "https://www.googleapis.com/auth/contacts"
 CONTACTS_READONLY_SCOPE = "https://www.googleapis.com/auth/contacts.readonly"
+# "Other contacts" (people the user has interacted with but never saved). The only
+# scope Google defines for this surface. Note it also authorises
+# otherContacts.copyOtherContactToMyContactsGroup (creates a saved contact); no
+# tool here calls it.
+OTHER_CONTACTS_READONLY_SCOPE = (
+    "https://www.googleapis.com/auth/contacts.other.readonly"
+)
 
 # Google Custom Search API scope
 CUSTOM_SEARCH_SCOPE = "https://www.googleapis.com/auth/cse"
@@ -183,7 +190,13 @@ SLIDES_SCOPES = [SLIDES_SCOPE, SLIDES_READONLY_SCOPE]
 
 TASKS_SCOPES = [TASKS_SCOPE, TASKS_READONLY_SCOPE]
 
-CONTACTS_SCOPES = [CONTACTS_SCOPE, CONTACTS_READONLY_SCOPE]
+# Household gate: the contacts service never requests the read-write "contacts"
+# scope, so a credential granted from this list cannot create, edit or delete
+# saved contacts through the People API's people.* mutations. The one mutation
+# the grant does permit is otherContacts.copyOtherContactToMyContactsGroup
+# (promotes an unsaved "other contact" to a saved one); no tool calls it. The
+# write tools remain registered and fail the decorator's scope check if reached.
+CONTACTS_SCOPES = [CONTACTS_READONLY_SCOPE, OTHER_CONTACTS_READONLY_SCOPE]
 
 CUSTOM_SEARCH_SCOPES = [CUSTOM_SEARCH_SCOPE]
 
@@ -231,7 +244,7 @@ TOOL_READONLY_SCOPES_MAP = {
     "forms": [FORMS_BODY_READONLY_SCOPE, FORMS_RESPONSES_READONLY_SCOPE],
     "slides": [SLIDES_READONLY_SCOPE],
     "tasks": [TASKS_READONLY_SCOPE],
-    "contacts": [CONTACTS_READONLY_SCOPE],
+    "contacts": [CONTACTS_READONLY_SCOPE, OTHER_CONTACTS_READONLY_SCOPE],
     "search": CUSTOM_SEARCH_SCOPES,
     "appscript": [
         SCRIPT_PROJECTS_READONLY_SCOPE,

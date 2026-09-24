@@ -306,6 +306,13 @@ class TestImports:
         assert hasattr(contacts_tools, "search_contacts")
         assert hasattr(contacts_tools, "manage_contact")
 
+    def test_import_other_contacts_tools(self):
+        """The two read-only 'Other contacts' tools exist."""
+        from gcontacts import contacts_tools
+
+        assert hasattr(contacts_tools, "search_other_contacts")
+        assert hasattr(contacts_tools, "list_other_contacts")
+
     def test_import_group_tools(self):
         """Test that group tools can be imported."""
         from gcontacts import contacts_tools
@@ -319,6 +326,158 @@ class TestImports:
         from gcontacts import contacts_tools
 
         assert hasattr(contacts_tools, "manage_contacts_batch")
+
+
+class TestReadOnlyContactsScopes:
+    """The contacts service is read-only at the Google boundary (household gate)."""
+
+    def test_contacts_service_requests_no_write_scope(self):
+        from auth.scopes import (
+            CONTACTS_SCOPE,
+            CONTACTS_READONLY_SCOPE,
+            OTHER_CONTACTS_READONLY_SCOPE,
+            TOOL_SCOPES_MAP,
+            TOOL_READONLY_SCOPES_MAP,
+        )
+
+        assert CONTACTS_SCOPE not in TOOL_SCOPES_MAP["contacts"]
+        assert set(TOOL_SCOPES_MAP["contacts"]) == {
+            CONTACTS_READONLY_SCOPE,
+            OTHER_CONTACTS_READONLY_SCOPE,
+        }
+        assert set(TOOL_READONLY_SCOPES_MAP["contacts"]) == {
+            CONTACTS_READONLY_SCOPE,
+            OTHER_CONTACTS_READONLY_SCOPE,
+        }
+        assert OTHER_CONTACTS_READONLY_SCOPE.endswith("/contacts.other.readonly")
+
+    def test_write_tools_need_a_scope_the_service_never_requests(self):
+        """The write tools still resolve to the read-write scope, so the decorator's
+        scope check refuses them against a credential granted from TOOL_SCOPES_MAP."""
+        from auth.scopes import CONTACTS_SCOPE, TOOL_SCOPES_MAP, has_required_scopes
+        from auth.service_decorator import SCOPE_GROUPS
+
+        assert SCOPE_GROUPS["contacts"] == CONTACTS_SCOPE
+        assert not has_required_scopes(TOOL_SCOPES_MAP["contacts"], [CONTACTS_SCOPE])
+
+    def test_other_contacts_scope_group_registered(self):
+        from auth.scopes import OTHER_CONTACTS_READONLY_SCOPE, TOOL_SCOPES_MAP, has_required_scopes
+        from auth.service_decorator import SCOPE_GROUPS
+
+        assert SCOPE_GROUPS["contacts_other_read"] == OTHER_CONTACTS_READONLY_SCOPE
+        assert has_required_scopes(
+            TOOL_SCOPES_MAP["contacts"], [SCOPE_GROUPS["contacts_other_read"]]
+        )
+        assert has_required_scopes(
+            TOOL_SCOPES_MAP["contacts"], [SCOPE_GROUPS["contacts_read"]]
+        )
+
+    def test_other_contacts_tools_in_core_tier(self):
+        from core.tool_tier_loader import ToolTierLoader
+
+        core = ToolTierLoader().get_tools_for_tier("core", ["contacts"])
+        assert "search_other_contacts" in core
+        assert "list_other_contacts" in core
+
+
+    def test_permissions_table_matches_scope_table(self):
+        """`--permissions` mode has its own scope table; it must not re-grant the
+        read-write scope at the readonly level and must carry the other-contacts
+        scope, or tool_registry drops the two new tools under it."""
+        from auth.permissions import SERVICE_PERMISSION_LEVELS
+        from auth.scopes import (
+            CONTACTS_SCOPE,
+            CONTACTS_READONLY_SCOPE,
+            OTHER_CONTACTS_READONLY_SCOPE,
+        )
+
+        levels = dict(SERVICE_PERMISSION_LEVELS["contacts"])
+        assert set(levels["readonly"]) == {
+            CONTACTS_READONLY_SCOPE,
+            OTHER_CONTACTS_READONLY_SCOPE,
+        }
+        assert CONTACTS_SCOPE not in levels["readonly"]
+        assert OTHER_CONTACTS_READONLY_SCOPE in levels["full"]
+
+
+class TestAuthFailureLogRedaction:
+    """WARNING/ERROR log lines carry a sha256 prefix, never an address."""
+
+    def test_redact_email_is_stable_prefix(self):
+        import hashlib
+        from auth.log_redaction import redact_email
+
+        addr = "someone@example.com"
+        expected = hashlib.sha256(addr.encode("utf-8")).hexdigest()[:12]
+        assert redact_email(addr) == expected
+        assert len(redact_email(addr)) == 12
+        assert "@" not in redact_email(addr)
+        assert redact_email(None) == "none"
+        assert redact_email("") == "none"
+
+    def test_redact_text_strips_every_address_shaped_token(self):
+        """The mismatched-account message carries TWO addresses; the token's
+        address must go too, not only the one the caller knows about."""
+        from auth.log_redaction import redact_email, redact_text
+
+        a = "someone@example.com"
+        b = "other.person+tag@sub.example.org"
+        msg = f"Authenticated account {b} does not match requested user {a}."
+        out = redact_text(ValueError(msg), a)
+        assert a not in out and b not in out
+        assert redact_email(a) in out and redact_email(b) in out
+        assert "@" not in out
+        # With no address hint at all, every address is still redacted.
+        assert a not in redact_text(msg)
+        assert redact_text("no address here") == "no address here"
+        assert redact_text("x", None) == "x"
+
+    def test_redact_text_output_never_contains_an_address_shaped_token(self):
+        """Astra round 1: a bare hash is a valid local part, so replacing
+        "a@b.com" inside "a@b.com@c.com" with the hash alone would leave
+        "<hash>@c.com". The marker is delimited; the output must not re-form."""
+        import re
+        from auth.log_redaction import redact_text
+
+        address = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+")
+        for text in (
+            "a@b.com@c.com",
+            "x@y.org@z.net@w.io",
+            "/home/u/creds/a@b.com_credentials.json@c.com",
+            "prefix a@b.com.@c.com suffix",
+        ):
+            out = redact_text(text)
+            assert not address.search(out), (text, out)
+            assert "[email:" in out
+
+    def test_decorator_uses_the_shared_helpers(self):
+        from auth import log_redaction
+        from auth.service_decorator import _redact_email, _redact_text
+
+        assert _redact_email is log_redaction.redact_email
+        assert _redact_text is log_redaction.redact_text
+
+    def test_no_warning_or_error_log_line_prints_an_address(self):
+        """Source-level guard over the three auth modules: no logger.warning /
+        logger.error f-string interpolates a raw {user_email} / {user_google_email}
+        (a later edit cannot regress silently). INFO/DEBUG lines are outside the
+        guard: production runs at WARNING."""
+        import inspect
+        import auth.service_decorator as sd
+        import auth.oauth21_session_store as st
+        import auth.credential_store as cs
+
+        raw_tokens = ("{user_email}", "{user_google_email}")
+        for mod in (sd, st, cs):
+            lines = inspect.getsource(mod).splitlines()
+            hits = []
+            for i, line in enumerate(lines):
+                if "logger.warning(" in line or "logger.error(" in line:
+                    # A call spans at most a few lines; scan to its closing paren.
+                    window = lines[i : i + 6]
+                    if any(tok in w for w in window for tok in raw_tokens):
+                        hits.append(f"{mod.__name__}:{i + 1}")
+            assert not hits, hits
 
 
 class TestConstants:

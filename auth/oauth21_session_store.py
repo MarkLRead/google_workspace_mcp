@@ -24,6 +24,7 @@ from fastmcp.server.auth import AccessToken
 from fastmcp.server.dependencies import get_http_headers
 from google.oauth2.credentials import Credentials
 from auth.oauth_config import is_external_oauth21_provider
+from auth.log_redaction import redact_email, redact_text
 
 logger = logging.getLogger(__name__)
 
@@ -685,7 +686,9 @@ class OAuth21SessionStore:
                 elif self._session_auth_binding[mcp_session_id] != user_email:
                     # Security: Attempt to bind session to different user
                     logger.error(
-                        f"SECURITY: Attempt to rebind session {mcp_session_id} from {self._session_auth_binding[mcp_session_id]} to {user_email}"
+                        f"SECURITY: Attempt to rebind session {mcp_session_id} from "
+                        f"{redact_email(self._session_auth_binding[mcp_session_id])} "
+                        f"to {redact_email(user_email)}"
                     )
                     raise ValueError(
                         f"Session {mcp_session_id} is already bound to a different user"
@@ -736,7 +739,10 @@ class OAuth21SessionStore:
                 return credentials
 
             except Exception as e:
-                logger.error(f"Failed to create credentials for {user_email}: {e}")
+                logger.error(
+                    f"Failed to create credentials for {redact_email(user_email)}: "
+                    f"{redact_text(e)}"
+                )
                 return None
 
     def get_credentials_by_mcp_session(

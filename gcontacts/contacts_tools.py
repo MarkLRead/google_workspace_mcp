@@ -17,7 +17,12 @@ from mcp.types import ToolAnnotations
 
 from auth.service_decorator import require_google_service
 from core.server import server
-from core.utils import UserInputError, handle_http_errors, StringList
+from core.utils import (
+    UserInputError,
+    handle_http_errors,
+    StringList,
+    _format_http_error_for_log,
+)
 from gcontacts.contacts_helpers import (
     _format_contact,
     _merge_emails,
@@ -744,6 +749,208 @@ async def search_contacts(
         response += _format_contact(person) + "\n\n"
 
     logger.info(f"Found {len(results)} contacts for {user_google_email}")
+    return response
+
+
+# =============================================================================
+# "Other contacts" — people the user has interacted with but never saved.
+# Scope contacts.other.readonly (the only one Google defines for this surface;
+# it also authorises copyOtherContactToMyContactsGroup, which nothing here
+# calls). The API limits readMask to names, emailAddresses, phoneNumbers.
+# =============================================================================
+
+OTHER_CONTACTS_READ_MASK = "names,emailAddresses,phoneNumbers"
+
+# Seconds to wait after a forced re-warm before the one retry (Google documents
+# "a few seconds" for the search cache to propagate).
+OTHER_CONTACTS_WARMUP_SETTLE_SECONDS = 3
+
+# Warm-up tracking for otherContacts.search (a separate cache from searchContacts)
+_other_search_cache_warmed_up: Dict[str, bool] = {}
+
+
+async def _warmup_other_search_cache(
+    service: Resource, user_google_email: str, force: bool = False
+) -> None:
+    """
+    Warm up the People API "other contacts" search cache.
+
+    Like people.searchContacts, otherContacts.search needs an initial empty
+    query before it returns results. Google's cache expires on its own; the
+    per-user latch here does not, so a caller that gets an empty result
+    re-warms once with force=True and retries before reporting a miss.
+    """
+    global _other_search_cache_warmed_up
+
+    if _other_search_cache_warmed_up.get(user_google_email) and not force:
+        return
+
+    try:
+        logger.debug("[contacts] Warming up other-contacts search cache")
+        await asyncio.to_thread(
+            service.otherContacts()
+            .search(query="", readMask="names", pageSize=1)
+            .execute
+        )
+        _other_search_cache_warmed_up[user_google_email] = True
+    except HttpError as e:
+        # Warmup failure is non-fatal, search may still work. Log the scrubbed
+        # form (status + reason), never the raw error with its request URL.
+        logger.warning(
+            "[contacts] Other-contacts search cache warmup failed: "
+            f"{_format_http_error_for_log(e)}"
+        )
+
+
+@server.tool(
+    title="Search Other Contacts",
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    ),
+)
+@require_google_service("people", "contacts_other_read")
+@handle_http_errors("search_other_contacts", service_type="people")
+async def search_other_contacts(
+    service: Resource,
+    user_google_email: str,
+    query: str,
+    page_size: int = 30,
+) -> str:
+    """
+    Search "Other contacts": people the user has emailed or interacted with but
+    never saved as a contact (Google's auto-collected list). Read-only.
+
+    Args:
+        user_google_email (str): The user's Google email address. Required.
+        query (str): Search query string (matches names, emails, phone numbers).
+        page_size (int): Maximum number of results to return (default: 30, max: 30).
+
+    Returns:
+        str: Matching other contacts with name, email and phone.
+    """
+    logger.info(f"[search_other_contacts] Invoked. query_len={len(query)}")
+
+    if page_size < 1:
+        raise UserInputError("page_size must be >= 1")
+    page_size = min(page_size, 30)
+
+    async def _search() -> List[Dict[str, Any]]:
+        result = await asyncio.to_thread(
+            service.otherContacts()
+            .search(
+                query=query,
+                readMask=OTHER_CONTACTS_READ_MASK,
+                pageSize=page_size,
+            )
+            .execute
+        )
+        return result.get("results", [])
+
+    await _warmup_other_search_cache(service, user_google_email)
+    results = await _search()
+
+    retried = False
+    if not results and _other_search_cache_warmed_up.get(user_google_email):
+        # An expired Google-side cache also answers []; re-warm once, give the
+        # cache the "few seconds" Google documents for propagation, and retry,
+        # so a stale latch cannot masquerade as a true miss.
+        await _warmup_other_search_cache(service, user_google_email, force=True)
+        await asyncio.sleep(OTHER_CONTACTS_WARMUP_SETTLE_SECONDS)
+        results = await _search()
+        retried = True
+
+    if not results:
+        note = (
+            " (the search index was re-warmed and the search retried; if this "
+            "person should be there, try once more in a few seconds)"
+            if retried
+            else ""
+        )
+        return (
+            f"No other contacts found matching '{query}' for {user_google_email}{note}."
+        )
+
+    response = (
+        f"Other-contacts results for '{query}' ({len(results)} found). "
+        "IDs are otherContacts/... and cannot be passed to get_contact.\n\n"
+    )
+
+    for item in results:
+        person = item.get("person", {})
+        response += _format_contact(person) + "\n\n"
+
+    logger.info(f"[search_other_contacts] Found {len(results)} other contacts")
+    return response
+
+
+@server.tool(
+    title="List Other Contacts",
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    ),
+)
+@require_google_service("people", "contacts_other_read")
+@handle_http_errors("list_other_contacts", service_type="people")
+async def list_other_contacts(
+    service: Resource,
+    user_google_email: str,
+    page_size: int = 100,
+    page_token: Optional[str] = None,
+) -> str:
+    """
+    List "Other contacts": people the user has emailed or interacted with but
+    never saved as a contact (Google's auto-collected list). Read-only.
+
+    Args:
+        user_google_email (str): The user's Google email address. Required.
+        page_size (int): Maximum number of entries to return (default: 100, max: 1000).
+        page_token (Optional[str]): Token for pagination.
+
+    Returns:
+        str: Other contacts with name, email and phone.
+    """
+    logger.info("[list_other_contacts] Invoked.")
+
+    if page_size < 1:
+        raise UserInputError("page_size must be >= 1")
+    page_size = min(page_size, 1000)
+
+    params: Dict[str, Any] = {
+        "readMask": OTHER_CONTACTS_READ_MASK,
+        "pageSize": page_size,
+    }
+    if page_token:
+        params["pageToken"] = page_token
+
+    result = await asyncio.to_thread(
+        service.otherContacts().list(**params).execute
+    )
+
+    people = result.get("otherContacts", [])
+    next_page_token = result.get("nextPageToken")
+    total_size = result.get("totalSize", len(people))
+
+    if not people:
+        return f"No other contacts found for {user_google_email}."
+
+    response = (
+        f"Other contacts for {user_google_email} ({len(people)} of {total_size}). "
+        "IDs are otherContacts/... and cannot be passed to get_contact.\n\n"
+    )
+
+    for person in people:
+        response += _format_contact(person) + "\n\n"
+
+    if next_page_token:
+        response += f"Next page token: {next_page_token}"
+
+    logger.info(f"[list_other_contacts] Found {len(people)} other contacts")
     return response
 
 

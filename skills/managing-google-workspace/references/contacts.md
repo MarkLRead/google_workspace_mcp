@@ -4,6 +4,7 @@ MCP tools for managing Google Contacts and contact groups. All tools require `us
 
 ## Contents
 - Contacts: search_contacts, list_contacts, get_contact, manage_contact, manage_contacts_batch
+- Other contacts (never saved, read-only): search_other_contacts, list_other_contacts
 - Contact Groups: list_contact_groups, get_contact_group, manage_contact_group
 - Tips
 
@@ -37,6 +38,24 @@ Get detailed information about a specific contact.
 |-----------|------|----------|---------|-------|
 | contact_id | string | yes | | e.g. `c1234567890` or `people/c1234567890` |
 | user_google_email | string | yes | | |
+
+### search_other_contacts
+Search "Other contacts": people the user has emailed or interacted with but never saved (Google's auto-collected list). Read-only; results carry name, email and phone only. Resource names are `otherContacts/...` and cannot be passed to `get_contact`.
+
+| Parameter | Type | Required | Default | Notes |
+|-----------|------|----------|---------|-------|
+| query | string | yes | | Matches names, emails, phone numbers |
+| user_google_email | string | yes | | |
+| page_size | integer | no | 30 | Max 30 |
+
+### list_other_contacts
+List "Other contacts" (never saved). Read-only; name, email and phone only.
+
+| Parameter | Type | Required | Default | Notes |
+|-----------|------|----------|---------|-------|
+| user_google_email | string | yes | | |
+| page_size | integer | no | 100 | Max 1000 |
+| page_token | any | no | | Pagination token |
 
 ### manage_contact
 Create, update, or delete a contact.

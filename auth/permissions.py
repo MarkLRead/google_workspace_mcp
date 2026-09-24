@@ -47,6 +47,7 @@ from auth.scopes import (
     TASKS_READONLY_SCOPE,
     CONTACTS_SCOPE,
     CONTACTS_READONLY_SCOPE,
+    OTHER_CONTACTS_READONLY_SCOPE,
     CUSTOM_SEARCH_SCOPE,
     SCRIPT_PROJECTS_SCOPE,
     SCRIPT_PROJECTS_READONLY_SCOPE,
@@ -111,8 +112,8 @@ SERVICE_PERMISSION_LEVELS: Dict[str, List[Tuple[str, List[str]]]] = {
         ("full", []),
     ],
     "contacts": [
-        ("readonly", [CONTACTS_READONLY_SCOPE]),
-        ("full", [CONTACTS_SCOPE]),
+        ("readonly", [CONTACTS_READONLY_SCOPE, OTHER_CONTACTS_READONLY_SCOPE]),
+        ("full", [CONTACTS_SCOPE, OTHER_CONTACTS_READONLY_SCOPE]),
     ],
     "search": [
         ("readonly", [CUSTOM_SEARCH_SCOPE]),

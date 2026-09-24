@@ -206,6 +206,8 @@ For parameters: [references/tasks.md](references/tasks.md)
 |------|------|
 | Search contacts | `search_contacts` |
 | Get contact | `get_contact` |
+| Search "Other contacts" (never saved) | `search_other_contacts` |
+| List "Other contacts" (never saved) | `list_other_contacts` |
 | Manage contact (CRUD) | `manage_contact` |
 | Batch manage contacts | `manage_contacts_batch` |
 | List contact groups | `list_contact_groups` |

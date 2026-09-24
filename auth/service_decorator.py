@@ -64,6 +64,7 @@ from auth.scopes import (
     TASKS_READONLY_SCOPE,
     CONTACTS_SCOPE,
     CONTACTS_READONLY_SCOPE,
+    OTHER_CONTACTS_READONLY_SCOPE,
     CUSTOM_SEARCH_SCOPE,
     SCRIPT_PROJECTS_SCOPE,
     SCRIPT_PROJECTS_READONLY_SCOPE,
@@ -73,6 +74,8 @@ from auth.scopes import (
     SCRIPT_SCRIPTAPP_SCOPE,
     has_required_scopes,
 )
+from auth.log_redaction import redact_email as _redact_email
+from auth.log_redaction import redact_text as _redact_text
 
 logger = logging.getLogger(__name__)
 
@@ -640,6 +643,7 @@ SCOPE_GROUPS = {
     # Contacts scopes
     "contacts": CONTACTS_SCOPE,
     "contacts_read": CONTACTS_READONLY_SCOPE,
+    "contacts_other_read": OTHER_CONTACTS_READONLY_SCOPE,
     # Custom Search scope
     "customsearch": CUSTOM_SEARCH_SCOPE,
     # Apps Script scopes
@@ -691,7 +695,7 @@ def _handle_token_refresh_error(
         or "expired or revoked" in error_str.lower()
     ):
         logger.warning(
-            f"Token expired or revoked for user {user_email} accessing {service_name}"
+            f"Token expired or revoked for user {_redact_email(user_email)} accessing {service_name}"
         )
 
         service_display_name = f"Google {service_name.title()}"
@@ -731,7 +735,10 @@ def _handle_token_refresh_error(
         )
     else:
         # Handle other types of refresh errors
-        logger.error(f"Unexpected refresh error for user {user_email}: {error}")
+        logger.error(
+            f"Unexpected refresh error for user {_redact_email(user_email)}: "
+            f"{_redact_text(error, user_email)}"
+        )
         if is_oauth21_enabled():
             if is_external_oauth21_provider():
                 return (
@@ -865,9 +872,9 @@ def require_google_service(
                 )
             except GoogleAuthenticationError as e:
                 logger.error(
-                    f"[{tool_name}] Auth failed for {user_google_email} | "
+                    f"[{tool_name}] Auth failed for {_redact_email(user_google_email)} | "
                     f"{service_name}/{service_version} | "
-                    f"method={auth_method or 'none'} | {e}"
+                    f"method={auth_method or 'none'} | {_redact_text(e, user_google_email)}"
                 )
                 # Re-raise the original error without wrapping it
                 raise
@@ -1024,9 +1031,9 @@ def require_multiple_services(service_configs: List[Dict[str, Any]]):
 
                         except GoogleAuthenticationError as e:
                             logger.error(
-                                f"[{tool_name}] Auth failed for {user_google_email} | "
+                                f"[{tool_name}] Auth failed for {_redact_email(user_google_email)} | "
                                 f"{service_name}/{service_version} | "
-                                f"method={auth_method or 'none'} | {e}"
+                                f"method={auth_method or 'none'} | {_redact_text(e, user_google_email)}"
                             )
                             # Re-raise the original error without wrapping it
                             raise
