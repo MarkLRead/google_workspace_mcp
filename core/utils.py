@@ -784,18 +784,29 @@ def encode_image_content(file_bytes: bytes, mime_type: str) -> str:
     return f"[base64_image:{mime_type}]{encoded}"
 
 
-_URL_QUERY_RE = re.compile(r"\?.*?(?=\s+returned(?:\s|$)|[>\"']|$)")
+# `[^\n]` rather than `.`: a query followed by a newline must not survive
+# because `.` stops at the newline and no terminator follows.
+_URL_QUERY_RE = re.compile(r"\?[^\n]*?(?=\s+returned(?:\s|$)|[>\"'\n]|$)")
+# People API resource ids sit in the URL PATH, not the query
+# (``people/<id>``, ``otherContacts/<id>``, ``contactGroups/<id>``), and a
+# caller can put a person's name there (``get_contact("John Smith")`` →
+# ``people/John%20Smith``). ``people/me`` is the fixed self-reference.
+_PEOPLE_PATH_ID_RE = re.compile(
+    r"/(people|otherContacts|contactGroups)/(?!me(?=[/?\s\"'>]|$))[^/?\s\"'>]+"
+)
 
 
 def _scrub_url_queries(text: str) -> str:
-    """Strip query strings from any URL embedded in ``text`` before logging.
+    """Strip query strings — and People API path ids — from any URL embedded in
+    ``text`` before logging.
 
     ``HttpError.__str__`` includes the full request URI, whose query string
     carries user content (e.g. ``.../messages?q=<the user's search terms>``)
     and can carry signed-URL secrets. The scheme/host/path identify the
     failing endpoint, which is all the log needs.
     """
-    return _URL_QUERY_RE.sub("?<query-redacted>", text)
+    text = _URL_QUERY_RE.sub("?<query-redacted>", text)
+    return _PEOPLE_PATH_ID_RE.sub(r"/\1/<id-redacted>", text)
 
 
 def _format_http_error_for_log(error: HttpError) -> str:
@@ -856,6 +867,20 @@ def handle_http_errors(
                 except HttpError as error:
                     user_google_email = kwargs.get("user_google_email", "N/A")
                     error_details = str(error)
+                    # Full detail (raw URL) at DEBUG only, before the scrub below.
+                    logger.debug(f"API error detail in {tool_name}", exc_info=True)
+                    # The text that leaves this handler (the raised message and
+                    # its chained cause) must not carry the request URL's query
+                    # string: it holds user content (a search query is a person's
+                    # name), and every re-logger upstream (the auth middleware,
+                    # FastMCP's own "Error calling tool" traceback) prints it
+                    # again. HttpError.__str__ is built from `uri`, so scrubbing
+                    # the exception's own uri cleans both, while Google's reason
+                    # and error body stay intact (the client needs them) and the
+                    # same object remains the cause.
+                    if getattr(error, "uri", None):
+                        error.uri = _scrub_url_queries(error.uri)
+                    error_text = str(error)
 
                     # Check if this is an API not enabled error
                     if (
@@ -873,7 +898,7 @@ def handle_http_errors(
                             )
                         else:
                             message = (
-                                f"API error in {tool_name}: {error}. "
+                                f"API error in {tool_name}: {error_text}. "
                                 f"The required API is not enabled for your project. "
                                 f"Please check the Google Cloud Console to enable it."
                             )
@@ -896,13 +921,13 @@ def handle_http_errors(
                                 "and the appropriate service_name."
                             )
                         message = (
-                            f"API error in {tool_name}: {error}. "
+                            f"API error in {tool_name}: {error_text}. "
                             f"You might need to re-authenticate for user '{user_google_email}'. "
                             f"{auth_hint}"
                         )
                     else:
                         # Other HTTP errors (400 Bad Request, etc.) - don't suggest re-auth
-                        message = f"API error in {tool_name}: {error}"
+                        message = f"API error in {tool_name}: {error_text}"
 
                     # ERROR gets the scrubbed form (HttpError embeds the request
                     # URI and may echo user content in its response details);
@@ -910,7 +935,6 @@ def handle_http_errors(
                     logger.error(
                         f"API error in {tool_name}: {_format_http_error_for_log(error)}"
                     )
-                    logger.debug(f"API error detail in {tool_name}", exc_info=True)
                     raise Exception(message) from error
                 except TransientNetworkError:
                     # Re-raise without wrapping to preserve the specific error type

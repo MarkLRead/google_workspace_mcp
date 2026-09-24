@@ -103,6 +103,39 @@ def test_scrub_url_queries_strips_embedded_request_uris():
     assert "<query-redacted>" in scrubbed
 
 
+def test_scrub_url_queries_redacts_people_api_path_ids_and_survives_newlines():
+    """2026-09-24 (mp-reviewer on the #303 leak fix): People API resource ids
+    sit in the URL PATH, and a caller can put a person's name there
+    (``get_contact("John Smith")`` → ``people/John%20Smith``); a query followed
+    by a raw newline must not survive either. ``people/me`` stays readable.
+    The path pattern needs the leading slash of an absolute URL (`/people/<id>`);
+    a relative `people/<id>` on its own is not a request URL shape."""
+    from core.utils import _scrub_url_queries
+
+    token = "zzqtestperson"
+    for msg in (
+        f"<HttpError 404 when requesting https://people.googleapis.com/v1/people/{token}?personFields=names returned \"Not Found\">",
+        f"https://people.googleapis.com/v1/people/{token}",
+        f"https://people.googleapis.com/v1/otherContacts/{token}?readMask=names",
+        f"https://people.googleapis.com/v1/contactGroups/{token}",
+        f"https://people.googleapis.com/v1/people/John%20Smith?personFields=names",
+    ):
+        out = _scrub_url_queries(msg)
+        assert token not in out and "John" not in out, (msg, out)
+        assert "<id-redacted>" in out
+        assert "people.googleapis.com/v1/" in out
+    # The self-reference and the search endpoints keep their shape.
+    assert _scrub_url_queries("https://people.googleapis.com/v1/people/me/connections?personFields=names") == (
+        "https://people.googleapis.com/v1/people/me/connections?<query-redacted>"
+    )
+    assert _scrub_url_queries(f"https://people.googleapis.com/v1/people:searchContacts?query={SECRET}") == (
+        "https://people.googleapis.com/v1/people:searchContacts?<query-redacted>"
+    )
+    # A query followed by a raw newline.
+    out = _scrub_url_queries(f"https://x.googleapis.com/v1/a?q={SECRET}\nnext line")
+    assert SECRET not in out and out.endswith("?<query-redacted>\nnext line")
+
+
 def test_log_level_override_survives_import_time_basic_config(tmp_path):
     """Earlier imports configure logging before main reads the override."""
     env = os.environ.copy()
@@ -221,6 +254,85 @@ async def test_handle_http_errors_scrubs_request_uri_at_error(caplog):
     error_text = " ".join(r.getMessage() for r in error_records)
     assert SECRET not in error_text
     assert "ExampleCorp" not in error_text
+    assert "<query-redacted>" in error_text
+    assert all(not r.exc_info for r in error_records)
+    assert any(r.exc_info for r in caplog.records if r.levelno == logging.DEBUG)
+
+
+@pytest.mark.asyncio
+async def test_handle_http_errors_raised_message_and_cause_are_scrubbed():
+    """The RAISED exception travels upstream to re-loggers this module does not
+    control (the auth middleware, FastMCP's "Error calling tool" traceback), so
+    its text must already be clean: no request query string (a search query is
+    a person's name), and the chained cause must be clean too (a traceback
+    prints `__cause__` verbatim, and HttpError's own str embeds its `uri`).
+    Google's reason and error body stay, and the HttpError object stays the
+    cause: the client and the gchat edit tests need them.
+    Found live on 2026-09-24: a synthetic token in a People API request reached
+    PM2's error log through exactly these two paths."""
+    from googleapiclient.errors import HttpError
+
+    from core.utils import handle_http_errors
+
+    class _Resp:
+        status = 404
+        reason = "Not Found"
+
+    uri = f"https://people.googleapis.com/v1/people:searchContacts?query={SECRET}&readMask=names"
+
+    # Astra a-20260924-g9e8: the body must survive UNCHANGED even when it holds
+    # a "?" — scrubbing the whole text would have clipped it.
+    body = "Invalid query? Requested entity was not found."
+
+    @handle_http_errors("search_contacts", service_type="people")
+    async def dummy():
+        content = f'{{"error": {{"message": "{body}"}}}}'.encode()
+        raise HttpError(_Resp(), content, uri=uri)
+
+    with pytest.raises(Exception) as excinfo:
+        await dummy()
+
+    text = str(excinfo.value)
+    assert SECRET not in text
+    assert "ExampleCorp" not in text
+    assert "<query-redacted>" in text
+    assert body in text
+    cause = excinfo.value.__cause__
+    assert isinstance(cause, HttpError)
+    assert SECRET not in str(cause) and "<query-redacted>" in str(cause)
+    assert SECRET not in (cause.uri or "")
+
+
+@pytest.mark.asyncio
+async def test_auth_middleware_logs_scrubbed_error_without_traceback_at_error(
+    caplog, monkeypatch
+):
+    """The middleware re-logs any tool error; a message carrying a request URL
+    must be scrubbed at ERROR, with the traceback at DEBUG only."""
+    from types import SimpleNamespace
+
+    from auth.auth_info_middleware import AuthInfoMiddleware
+
+    middleware = AuthInfoMiddleware()
+
+    async def _noop(context):
+        return None
+
+    monkeypatch.setattr(middleware, "_process_request_for_auth", _noop)
+    context = SimpleNamespace(fastmcp_context=None)
+    url = f"https://people.googleapis.com/v1/otherContacts:search?query={SECRET}"
+
+    async def call_next(ctx):
+        raise RuntimeError(f"<HttpError 400 when requesting {url} returned 'Bad Request'>")
+
+    with caplog.at_level(logging.DEBUG):
+        with pytest.raises(RuntimeError):
+            await middleware.on_call_tool(context, call_next)
+
+    error_records = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert error_records
+    error_text = " ".join(r.getMessage() for r in error_records)
+    assert SECRET not in error_text
     assert "<query-redacted>" in error_text
     assert all(not r.exc_info for r in error_records)
     assert any(r.exc_info for r in caplog.records if r.levelno == logging.DEBUG)

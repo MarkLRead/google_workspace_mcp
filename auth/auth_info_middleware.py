@@ -402,7 +402,15 @@ class AuthInfoMiddleware(Middleware):
             ):
                 logger.info(f"Authentication check failed: {e}")
             else:
-                logger.error(f"Error in on_call_tool middleware: {e}", exc_info=True)
+                # The message may carry a request URL (an HttpError's text holds
+                # the query string, i.e. user content such as a searched name):
+                # scrub it at ERROR; the full traceback stays at DEBUG.
+                from core.utils import _scrub_url_queries  # local: core.utils imports auth.*
+
+                logger.error(
+                    f"Error in on_call_tool middleware: {_scrub_url_queries(str(e))}"
+                )
+                logger.debug("on_call_tool middleware error detail", exc_info=True)
             raise
 
     async def on_get_prompt(self, context: MiddlewareContext, call_next):
