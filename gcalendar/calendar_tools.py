@@ -18,7 +18,7 @@ from googleapiclient.errors import HttpError
 from googleapiclient.discovery import build
 
 from auth.service_decorator import require_google_service
-from core.utils import handle_http_errors, StringList
+from core.utils import handle_http_errors, StringList, scrub_http_error_uri
 from gcalendar.calendar_helpers import (
     _format_event_detail_lines,
     _format_event_time,
@@ -1221,15 +1221,18 @@ async def _modify_event_impl(
             )
 
     except HttpError as get_error:
+        # Scrub the request URL on the object: the lines below log it and the
+        # 404 branch raises with it as the implicit cause.
+        get_error_text = scrub_http_error_uri(get_error)
         if get_error.resp.status == 404:
             logger.error(
-                f"[modify_event] Event not found during pre-update verification: {get_error}"
+                f"[modify_event] Event not found during pre-update verification: {get_error_text}"
             )
             message = f"Event not found during verification. The event with ID '{event_id}' could not be found in calendar '{calendar_id}'. This may be due to incorrect ID format or the event no longer exists."
             raise Exception(message)
         else:
             logger.warning(
-                f"[modify_event] Error during pre-update verification, but proceeding with update: {get_error}"
+                f"[modify_event] Error during pre-update verification, but proceeding with update: {get_error_text}"
             )
 
     updated_event = await asyncio.to_thread(
@@ -1296,15 +1299,16 @@ async def _delete_event_impl(
         )
         logger.info("[delete_event] Successfully verified event exists before deletion")
     except HttpError as get_error:
+        get_error_text = scrub_http_error_uri(get_error)
         if get_error.resp.status == 404:
             logger.error(
-                f"[delete_event] Event not found during pre-delete verification: {get_error}"
+                f"[delete_event] Event not found during pre-delete verification: {get_error_text}"
             )
             message = f"Event not found during verification. The event with ID '{event_id}' could not be found in calendar '{calendar_id}'. This may be due to incorrect ID format or the event no longer exists."
             raise Exception(message)
         else:
             logger.warning(
-                f"[delete_event] Error during pre-delete verification, but proceeding with deletion: {get_error}"
+                f"[delete_event] Error during pre-delete verification, but proceeding with deletion: {get_error_text}"
             )
 
     # Proceed with the deletion

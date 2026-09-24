@@ -18,7 +18,7 @@ from mcp.types import ToolAnnotations
 
 from auth.service_decorator import require_google_service
 from core.server import server
-from core.utils import UserInputError, handle_http_errors
+from core.utils import UserInputError, handle_http_errors, scrub_http_error_uri
 
 logger = logging.getLogger(__name__)
 
@@ -28,7 +28,10 @@ LIST_TASKS_MAX_POSITION = "99999999999999999999"
 
 
 def _format_reauth_message(error: Exception, user_google_email: str) -> str:
-    base = f"API error: {error}"
+    # The message is logged at ERROR with exc_info AND raised: scrub the
+    # request URL's query string on the error object itself so the log line,
+    # the traceback and the chained cause are all clean.
+    base = f"API error: {scrub_http_error_uri(error)}"
 
     # Only suggest re-authentication for auth-related errors (401, 403)
     if isinstance(error, HttpError) and error.resp.status in (401, 403):

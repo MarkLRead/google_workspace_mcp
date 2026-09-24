@@ -434,5 +434,11 @@ class AuthInfoMiddleware(Middleware):
             ):
                 logger.info(f"Authentication check failed in prompt: {e}")
             else:
-                logger.error(f"Error in on_get_prompt middleware: {e}", exc_info=True)
+                # Same rule as on_call_tool: scrubbed at ERROR, traceback at DEBUG.
+                from core.utils import _scrub_url_queries  # local: core.utils imports auth.*
+
+                logger.error(
+                    f"Error in on_get_prompt middleware: {_scrub_url_queries(str(e))}"
+                )
+                logger.debug("on_get_prompt middleware error detail", exc_info=True)
             raise

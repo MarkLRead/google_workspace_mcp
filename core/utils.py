@@ -786,34 +786,103 @@ def encode_image_content(file_bytes: bytes, mime_type: str) -> str:
 
 # `[^\n]` rather than `.`: a query followed by a newline must not survive
 # because `.` stops at the newline and no terminator follows.
-_URL_QUERY_RE = re.compile(r"\?[^\n]*?(?=\s+returned(?:\s|$)|[>\"'\n]|$)")
+# Both patterns skip their own placeholder so a second pass is a no-op: the
+# scrubbed text is scrubbed again by every re-logger upstream (the auth
+# middleware calls this on the raised message, whose uri was already cleaned),
+# and a non-idempotent pass left a doubled `>` (`<id-redacted>>`).
+_QUERY_PLACEHOLDER = "<query-redacted>"
+_ID_PLACEHOLDER = "<id-redacted>"
+# The placeholder is skipped only as a COMPLETE component (a terminator or the
+# end must follow it): `?<query-redacted>Alice` is not scrubbed text and must
+# be scrubbed again (Astra a-20260924-3wee).
+# A partial placeholder (`?<query-redacted>Alice`) is consumed explicitly first,
+# because its own `>` is a terminator for the lazy tail.
+_URL_QUERY_RE = re.compile(
+    r"\?(?!"
+    + re.escape(_QUERY_PLACEHOLDER)
+    + r"(?=[\s>\"'\n]|$))(?:"
+    + re.escape(_QUERY_PLACEHOLDER)
+    + r")?[^\n]*?(?=\s+returned(?:\s|$)|[>\"'\n]|$)"
+)
 # People API resource ids sit in the URL PATH, not the query
 # (``people/<id>``, ``otherContacts/<id>``, ``contactGroups/<id>``), and a
 # caller can put a person's name there (``get_contact("John Smith")`` →
 # ``people/John%20Smith``). ``people/me`` is the fixed self-reference.
+# The id character class and the `me` boundary agree exactly: people.get uses
+# reserved expansion, so an apostrophe goes out unencoded (`people/John O'Brien`
+# and `people/me'Jane`), and `'` is therefore part of an id, never its end
+# (mp-reviewer + Astra a-20260924-3wee, 2026-09-24).
+_PATH_SEGMENT_END = r"(?=[/?\s\">]|$)"
+# `(?:<id-redacted>)?` consumes a PARTIAL placeholder (`<id-redacted>Alice`)
+# whose own `>` would otherwise stop the id class one character short.
+_PATH_ID_TAIL = r"(?:" + re.escape(_ID_PLACEHOLDER) + r")?[^/?\s\">]+"
 _PEOPLE_PATH_ID_RE = re.compile(
-    r"/(people|otherContacts|contactGroups)/(?!me(?=[/?\s\"'>]|$))[^/?\s\"'>]+"
+    r"/(people|otherContacts|contactGroups)/(?!(?:me|"
+    + re.escape(_ID_PLACEHOLDER)
+    + r")"
+    + _PATH_SEGMENT_END
+    + r")"
+    + _PATH_ID_TAIL
+)
+# Calendar API paths carry the calendar id, which is usually an e-mail address
+# (`calendars/<id>/events/<eventId>`, `users/me/calendarList/<id>`);
+# `primary` is the fixed self-reference.
+_CALENDAR_PATH_ID_RE = re.compile(
+    r"/(calendars|calendarList)/(?!(?:primary|"
+    + re.escape(_ID_PLACEHOLDER)
+    + r")"
+    + _PATH_SEGMENT_END
+    + r")"
+    + _PATH_ID_TAIL
 )
 
 
 def _scrub_url_queries(text: str) -> str:
     """Strip query strings — and People API path ids — from any URL embedded in
-    ``text`` before logging.
+    ``text`` before logging. Idempotent: scrubbing scrubbed text changes nothing.
 
     ``HttpError.__str__`` includes the full request URI, whose query string
     carries user content (e.g. ``.../messages?q=<the user's search terms>``)
     and can carry signed-URL secrets. The scheme/host/path identify the
     failing endpoint, which is all the log needs.
     """
-    text = _URL_QUERY_RE.sub("?<query-redacted>", text)
-    return _PEOPLE_PATH_ID_RE.sub(r"/\1/<id-redacted>", text)
+    text = _URL_QUERY_RE.sub("?" + _QUERY_PLACEHOLDER, text)
+    text = _PEOPLE_PATH_ID_RE.sub(r"/\1/" + _ID_PLACEHOLDER, text)
+    return _CALENDAR_PATH_ID_RE.sub(r"/\1/" + _ID_PLACEHOLDER, text)
+
+
+# A bare request URI (``HttpError.uri``) has no exception-wrapper terminators:
+# everything from the first `?` to the end IS the query, whatever it holds
+# (a raw `'` or `>` can reach it through reserved path expansion — Astra
+# a-20260924-8ao3). Replace it whole, then redact path ids as usual.
+_BARE_URI_QUERY_RE = re.compile(r"\?.*\Z", re.DOTALL)
+
+
+def _scrub_bare_uri(uri: str) -> str:
+    return _scrub_url_queries(_BARE_URI_QUERY_RE.sub("?" + _QUERY_PLACEHOLDER, uri))
+
+
+def scrub_http_error_uri(error: BaseException) -> str:
+    """Scrub an ``HttpError``'s request ``uri`` IN PLACE and return ``str(error)``.
+
+    Use this wherever an HttpError's text is logged or re-raised outside
+    ``handle_http_errors``: ``HttpError.__str__`` is built from ``uri``, so
+    cleaning the object cleans the log line, the raised message and the
+    chained cause that every re-logger upstream prints again (lesson: a
+    scrubbed log line is not enough when the exception travels on). Google's
+    reason and body are untouched. A non-HttpError is returned as its str.
+    """
+    uri = getattr(error, "uri", None) if isinstance(error, HttpError) else None
+    if isinstance(uri, str) and uri:
+        error.uri = _scrub_bare_uri(uri)
+    return str(error)
 
 
 def _format_http_error_for_log(error: HttpError) -> str:
     """Return operational HTTP failure context without response-body text."""
     status = getattr(error.resp, "status", "unknown")
     uri = getattr(error, "uri", None)
-    request = _scrub_url_queries(uri) if uri else "<unknown>"
+    request = _scrub_bare_uri(uri) if uri else "<unknown>"
     return f"status={status}, request={request}"
 
 
@@ -878,9 +947,7 @@ def handle_http_errors(
                     # the exception's own uri cleans both, while Google's reason
                     # and error body stay intact (the client needs them) and the
                     # same object remains the cause.
-                    if getattr(error, "uri", None):
-                        error.uri = _scrub_url_queries(error.uri)
-                    error_text = str(error)
+                    error_text = scrub_http_error_uri(error)
 
                     # Check if this is an API not enabled error
                     if (
