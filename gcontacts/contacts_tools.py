@@ -26,6 +26,7 @@ from core.utils import (
 from gcontacts.contacts_helpers import (
     _format_contact,
     _merge_emails,
+    _merge_names,
     _merge_nicknames,
     _merge_organizations,
     _merge_phones,
@@ -376,7 +377,8 @@ def _build_person_body(
     if relations is not None:
         relations = [_coerce_relation_input(r) for r in relations]
 
-    if given_name or family_name:
+    # "" is a value too: it clears that part (lesson #301 / Astra a-20260926-3mvh)
+    if given_name is not None or family_name is not None:
         body["names"] = [
             {
                 "givenName": given_name or "",
@@ -1185,6 +1187,12 @@ async def manage_contact(
             # Apply merge modes for array fields
             merged_body: Dict[str, Any] = dict(new_body)
 
+            if "names" in new_body:
+                # lesson #301: keep the parts of the name the caller did not give
+                merged_body["names"] = _merge_names(
+                    current.get("names", []), given_name, family_name
+                )
+
             if "phoneNumbers" in new_body:
                 merged_body["phoneNumbers"] = _merge_phones(
                     current.get("phoneNumbers", []),
@@ -1622,18 +1630,21 @@ async def manage_contacts_batch(
             service.people()
             .getBatchGet(
                 resourceNames=resource_names,
-                personFields="metadata",
+                # lesson #301: the names merge needs the current names too
+                personFields="metadata,names" if field == "names" else "metadata",
             )
             .execute
         )
 
         etags = {}
+        current_names: Dict[str, List[Dict[str, Any]]] = {}
         for resp in batch_get_result.get("responses", []):
             person = resp.get("person", {})
             rname = person.get("resourceName")
             etag = person.get("etag")
             if rname and etag:
                 etags[rname] = etag
+                current_names[rname] = person.get("names", [])
 
         # Map field name to body key produced by _build_person_body
         field_to_body_key = {
@@ -1688,6 +1699,12 @@ async def manage_contacts_batch(
                     f"Field '{field}' (key '{body_key}') not present in update for {cid}, skipping"
                 )
                 continue
+
+            if body_key == "names":
+                # lesson #301: keep the parts of the name the caller did not give
+                body["names"] = _merge_names(
+                    current_names.get(cid, []), update.given_name, update.family_name
+                )
 
             person_body = {
                 "etag": etag,

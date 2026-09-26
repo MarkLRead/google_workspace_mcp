@@ -10,7 +10,7 @@ tool definitions and Pydantic input models in contacts_tools.py.
 import datetime
 import logging
 import re
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -258,6 +258,65 @@ def _format_contact(person: Dict[str, Any], detailed: bool = False) -> str:
                     lines.append(f"Sources: {', '.join(source_types)}")
 
     return "\n".join(lines)
+
+
+_WRITABLE_NAME_FIELDS = (
+    "givenName",
+    "familyName",
+    "middleName",
+    "honorificPrefix",
+    "honorificSuffix",
+    "phoneticGivenName",
+    "phoneticFamilyName",
+    "phoneticMiddleName",
+    "phoneticFullName",
+    "phoneticHonorificPrefix",
+    "phoneticHonorificSuffix",
+)  # no unstructuredName: a stale one next to a changed part could win (mp-reviewer R90)
+
+
+def _merge_names(
+    existing: List[Dict[str, Any]],
+    given_name: Optional[str],
+    family_name: Optional[str],
+) -> List[Dict[str, Any]]:
+    """
+    Read-merge-write for the names block (lesson #301).
+
+    ``updateContact`` replaces the whole ``names`` array, so an update that gave only
+    ``family_name`` used to erase the given name. Start from the contact's OWN name entry
+    (``metadata.source.type`` CONTACT, or no source at all; a name a linked profile
+    supplies is never copied into the contact — Astra a-20260926-3mvh), preferring the
+    primary one; keep only the writable fields (the output-only ones such as
+    ``displayName`` and ``metadata`` are left out); overlay the parts the caller
+    supplied; return a one-entry list. ``None`` means "leave as is"; an empty string
+    clears that part (the body builder emits ``names`` for "" too).
+    """
+    contact: List[Dict[str, Any]] = []
+    unsourced: List[Dict[str, Any]] = []
+    for n in existing or []:
+        if not n:
+            continue
+        source = ((n.get("metadata") or {}).get("source") or {}).get("type")
+        if source == "CONTACT":
+            contact.append(n)
+        elif source is None:
+            unsourced.append(n)
+    # an explicitly CONTACT-sourced entry always beats a source-less one (Astra a-20260926-45q6)
+    own = contact or unsourced
+    base_entry: Dict[str, Any] = {}
+    for n in own:
+        if (n.get("metadata") or {}).get("primary"):
+            base_entry = n
+            break
+    if not base_entry and own:
+        base_entry = own[0]
+    base = {k: v for k, v in base_entry.items() if k in _WRITABLE_NAME_FIELDS}
+    if given_name is not None:
+        base["givenName"] = given_name
+    if family_name is not None:
+        base["familyName"] = family_name
+    return [base]
 
 
 def _merge_phones(
