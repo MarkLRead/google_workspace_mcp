@@ -323,7 +323,7 @@ class AuditLog:
             # O_NONBLOCK: a FIFO at the path must fail here, not hang the start.
             fd = os.open(
                 path,
-                os.O_WRONLY
+                os.O_RDWR  # read: only to look at the last byte, below
                 | os.O_CREAT
                 | os.O_APPEND
                 | getattr(os, "O_NOFOLLOW", 0)
@@ -340,6 +340,12 @@ class AuditLog:
                 os.fchmod(fd, 0o600)
             if hasattr(os, "O_NONBLOCK"):
                 os.set_blocking(fd, True)  # writes must block, never EAGAIN
+            # A file left without its final newline (a write cut short before a
+            # restart): the first record must start a line of its own. O_APPEND
+            # puts every write at the end wherever this read leaves the offset.
+            if info.st_size > 0:
+                os.lseek(fd, -1, os.SEEK_END)
+                self._torn = os.read(fd, 1) != b"\n"
         except OSError as exc:
             if fd >= 0:
                 try:
@@ -398,7 +404,8 @@ def _session(context: MiddlewareContext) -> Optional[str]:
         return None
     if not isinstance(session_id, str) or not session_id:
         return None
-    return hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:8]
+    data = session_id.encode("utf-8", "surrogatepass")
+    return hashlib.sha256(data).hexdigest()[:8]
 
 
 async def _declared(context: MiddlewareContext) -> Optional[Dict[str, Any]]:

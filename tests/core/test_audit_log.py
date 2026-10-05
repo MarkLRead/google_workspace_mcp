@@ -531,7 +531,10 @@ async def test_a_failed_write_never_fails_the_tool(tmp_path, caplog, monkeypatch
         assert await _call(audit_log, "list_calendars", {}) == "ran"
     assert "Audit log write failed (OSError)" in caplog.text
     monkeypatch.undo()
-    # the next record must not be glued to the torn one
+    # the next record must not be glued to the torn one, even after a restart
+    # (a new AuditLog on the same file knows nothing of the failed write)
+    audit_log.close()
+    audit_log = AuditLog(str(path))
     assert await _call(audit_log, "list_calendars", {}) == "ran"
     raw = path.read_text(encoding="utf-8").splitlines()
     assert len(raw) == 3 and len(raw[1]) == 3
