@@ -20,6 +20,7 @@ from auth.email_allowlist import (
     load_allowed_emails,
 )
 from core.camel_case_middleware import CamelCaseArgumentsMiddleware
+from core.audit_log import AuditLogMiddleware, load_audit_log
 from core.disabled_actions import DisabledActionsMiddleware, load_disabled_actions
 from auth.google_auth import handle_auth_callback, start_auth_flow, check_client_secrets
 from auth.gateway_identity import get_verified_gateway_principal
@@ -378,6 +379,14 @@ server.add_middleware(auth_info_middleware)
 # mirror the Google API field names, mapping them onto the snake_case tool
 # parameters. See https://github.com/taylorwilsdon/google_workspace_mcp/issues/918
 server.add_middleware(CamelCaseArgumentsMiddleware())
+
+# Record one line per tool call (tool, action, counts, outcome; never argument
+# content) when WORKSPACE_MCP_AUDIT_LOG names a file. Added before the
+# disabled-actions middleware so a refused action is recorded too. An unusable
+# path raises here and stops start-up.
+_audit_log = load_audit_log()
+if _audit_log is not None:
+    server.add_middleware(AuditLogMiddleware(_audit_log))
 
 # Refuse configured actions of compound tools (e.g. manage_event:delete).
 # A malformed WORKSPACE_MCP_DISABLED_ACTIONS raises here and stops start-up.
