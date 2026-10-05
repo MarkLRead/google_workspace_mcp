@@ -39,6 +39,11 @@ A write that fails later (disk full, descriptor gone) does not fail the tool
 call; it is reported at WARNING in the normal log. A file that is deleted or
 renamed while the server runs keeps receiving lines on the old descriptor, which
 is what ``copytruncate`` rotation expects.
+
+The file is created 0600 and an existing looser file is tightened. A file that is
+already 0600 is opened as it is, so root may create it beforehand and mark it
+append-only (``chattr +a``): the server can then add lines but can neither
+rewrite nor remove what it has written.
 """
 
 import hashlib
@@ -46,6 +51,7 @@ import json
 import logging
 import os
 import re
+import stat
 import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -293,7 +299,10 @@ class AuditLog:
                 os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0),
                 0o600,
             )
-            os.fchmod(self._fd, 0o600)
+            # Only when it is needed: a file root has marked append-only
+            # (chattr +a) refuses every chmod, even one that changes nothing.
+            if stat.S_IMODE(os.fstat(self._fd).st_mode) != 0o600:
+                os.fchmod(self._fd, 0o600)
         except OSError as exc:
             raise AuditLogConfigError(
                 f"{AUDIT_LOG_ENV}: cannot open the audit log for append "

@@ -155,6 +155,28 @@ def test_file_is_private_and_appended_to(monkeypatch, tmp_path):
     assert stat.S_IMODE(os.stat(fresh).st_mode) == 0o600
 
 
+def test_a_file_that_is_already_private_is_not_chmodded(monkeypatch, tmp_path):
+    # root may mark the file append-only (chattr +a); every chmod is then refused,
+    # even one that changes nothing, and the server must still start.
+    path = tmp_path / "audit.log"
+    path.write_text("", encoding="utf-8")
+    os.chmod(path, 0o600)
+
+    def refuse(*args, **kwargs):
+        raise PermissionError(1, "Operation not permitted")
+
+    monkeypatch.setattr(audit_log_module.os, "fchmod", refuse)
+    audit_log = AuditLog(str(path))
+    assert audit_log.write({"tool": "x"}) is True
+    audit_log.close()
+
+    loose = tmp_path / "loose.log"
+    loose.write_text("", encoding="utf-8")
+    os.chmod(loose, 0o644)
+    with pytest.raises(AuditLogConfigError):  # a loose file that cannot be tightened
+        AuditLog(str(loose))
+
+
 # --- what a line holds, and what it never holds ---------------------------------
 
 
