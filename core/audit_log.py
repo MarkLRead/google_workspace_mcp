@@ -50,7 +50,6 @@ import hashlib
 import json
 import logging
 import os
-import re
 import stat
 import time
 from datetime import datetime, timezone
@@ -83,10 +82,30 @@ _SYSTEM_LABELS = frozenset(
         "CATEGORY_FORUMS",
     }
 )
-_ACTION_RE = re.compile(r"[a-z_]{1,24}")
+# The action words this server's tools act on. A tool that declares ``action`` as
+# a plain string (no enum) is checked against this list instead: a word that is
+# not here is caller text and is written as "?".
+_KNOWN_ACTIONS = frozenset(
+    {
+        "clear_completed",
+        "create",
+        "delete",
+        "grant",
+        "grant_batch",
+        "hide",
+        "modify_members",
+        "move",
+        "populate_from_markdown",
+        "rename",
+        "reorder",
+        "revoke",
+        "transfer_owner",
+        "unhide",
+        "update",
+    }
+)
 _TRUE = frozenset({"true", "t", "yes", "y", "on", "1"})
 _FALSE = frozenset({"false", "f", "no", "n", "off", "0"})
-_MAX_LABELS = 10
 _MAX_NAMES = 40
 _MAX_IDS = 1000
 _MIN_ID_LENGTH = 8
@@ -98,7 +117,10 @@ class AuditLogConfigError(ValueError):
 
 def fingerprint(value: str) -> str:
     """One-way tag of an id: enough to recognise it, not to recover it."""
-    return hashlib.sha256(value.strip().encode("utf-8")).hexdigest()[:12]
+    # surrogatepass: JSON may carry a lone surrogate, which strict UTF-8 refuses;
+    # one odd id must not cost the whole record.
+    data = value.strip().encode("utf-8", "surrogatepass")
+    return hashlib.sha256(data).hexdigest()[:12]
 
 
 def _id_tag(value: str) -> str:
@@ -131,7 +153,7 @@ def _as_bool(value: Any) -> Optional[bool]:
     """A yes/no argument the way pydantic will read it, or None if it will not."""
     if isinstance(value, bool):
         return value
-    if isinstance(value, int) and value in (0, 1):
+    if isinstance(value, (int, float)) and value in (0, 1):  # 1.0 and 0.0 too
         return bool(value)
     if isinstance(value, str):
         text = value.strip().casefold()
@@ -155,7 +177,7 @@ def _action(value: Any, schema: Any) -> str:
     if isinstance(allowed, list):
         known = {item.casefold() for item in allowed if isinstance(item, str)}
         return text if text in known else "?"
-    return text if _ACTION_RE.fullmatch(text) else "?"
+    return text if text in _KNOWN_ACTIONS else "?"
 
 
 def _labels(value: Any) -> Optional[List[str]]:
@@ -169,7 +191,9 @@ def _labels(value: Any) -> Optional[List[str]]:
         label = name if name in _SYSTEM_LABELS else "USER"
         if label not in seen:
             seen.append(label)
-    return seen[:_MAX_LABELS]
+    # Never cut: the names come from a fixed list of 14 plus "USER", and a cut
+    # would let a padded list push TRASH out of the record.
+    return seen
 
 
 def _ids(arguments: Dict[str, Any]) -> Tuple[List[str], int, int]:
@@ -293,34 +317,62 @@ class AuditLog:
 
     def __init__(self, path: str) -> None:
         self.path = path
+        self._torn = False  # the last write left a line without its newline
+        fd = -1
         try:
-            self._fd = os.open(
+            # O_NONBLOCK: a FIFO at the path must fail here, not hang the start.
+            fd = os.open(
                 path,
-                os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0),
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_APPEND
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_NONBLOCK", 0),
                 0o600,
             )
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode):
+                # a device or a pipe would take the lines and keep none
+                raise OSError("not a regular file")
             # Only when it is needed: a file root has marked append-only
             # (chattr +a) refuses every chmod, even one that changes nothing.
-            if stat.S_IMODE(os.fstat(self._fd).st_mode) != 0o600:
-                os.fchmod(self._fd, 0o600)
+            if stat.S_IMODE(info.st_mode) != 0o600 and hasattr(os, "fchmod"):
+                os.fchmod(fd, 0o600)
+            if hasattr(os, "O_NONBLOCK"):
+                os.set_blocking(fd, True)  # writes must block, never EAGAIN
         except OSError as exc:
+            if fd >= 0:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
             raise AuditLogConfigError(
                 f"{AUDIT_LOG_ENV}: cannot open the audit log for append "
                 f"({type(exc).__name__})"
             ) from exc
+        self._fd = fd
 
     def write(self, record: Dict[str, Any]) -> bool:
         data = (
             json.dumps(record, separators=(",", ":"), sort_keys=True) + "\n"
         ).encode("utf-8")
+        if self._torn:
+            # An earlier write stopped part-way: end that broken line first, so
+            # this record starts a line of its own.
+            data = b"\n" + data
+        view = memoryview(data)
         try:
-            written = os.write(self._fd, data)
+            # os.write may take only part of the buffer: go on until it is all out.
+            while view:
+                written = os.write(self._fd, view)
+                if written <= 0:
+                    raise OSError("no progress")
+                self._torn = True
+                view = view[written:]
         except OSError as exc:
             logger.warning("Audit log write failed (%s)", type(exc).__name__)
             return False
-        if written != len(data):
-            logger.warning("Audit log write was cut short")
-            return False
+        self._torn = False
         return True
 
     def close(self) -> None:
@@ -369,25 +421,37 @@ class AuditLogMiddleware(Middleware):
 
     async def on_call_tool(self, context: MiddlewareContext, call_next: CallNext):
         started = time.monotonic()
-        declared = await _declared(context)
+        declared: Optional[Dict[str, Any]] = None
         error: Optional[BaseException] = None
         try:
+            # Inside the try: a call cancelled while the tool is looked up must
+            # leave its line too.
+            declared = await _declared(context)
             return await call_next(context)
         except BaseException as exc:
             error = exc
             raise
         finally:
+            elapsed_ms = int((time.monotonic() - started) * 1000)
             try:
-                self._audit_log.write(
-                    build_record(
-                        getattr(context.message, "name", None),
-                        getattr(context.message, "arguments", None),
-                        declared,
-                        ok=error is None,
-                        error=error,
-                        elapsed_ms=int((time.monotonic() - started) * 1000),
-                        session=_session(context),
-                    )
+                record = build_record(
+                    getattr(context.message, "name", None),
+                    getattr(context.message, "arguments", None),
+                    declared,
+                    ok=error is None,
+                    error=error,
+                    elapsed_ms=elapsed_ms,
+                    session=_session(context),
                 )
-            except Exception as exc:  # never let the audit trail break a tool call
+            except Exception as exc:
+                # The record could not be built from these arguments: the call
+                # still leaves a line, with nothing taken from them.
                 logger.warning("Audit log record failed (%s)", type(exc).__name__)
+                record = build_record(
+                    None, None, None, error is None, error, elapsed_ms
+                )
+                record["audit_err"] = type(exc).__name__
+            try:
+                self._audit_log.write(record)
+            except Exception as exc:  # never let the audit trail break a tool call
+                logger.warning("Audit log write failed (%s)", type(exc).__name__)

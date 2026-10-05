@@ -257,12 +257,34 @@ def test_a_trash_sent_in_the_loose_forms_the_tools_accept_is_still_seen():
         fingerprint("18c0ffee0000aaaa"),
         fingerprint("18c0ffee0000bbbb"),
     ]
-    for loose in ("true", " True ", "yes", 1):
+    # a padded list must not push TRASH out of the record (list or JSON string)
+    padded = [
+        SECRETS[3],
+        "INBOX",
+        "UNREAD",
+        "STARRED",
+        "IMPORTANT",
+        "CATEGORY_PERSONAL",
+        "CATEGORY_SOCIAL",
+        "CATEGORY_PROMOTIONS",
+        "CATEGORY_UPDATES",
+        "CATEGORY_FORUMS",
+        "SENT",
+        "TRASH",
+    ]
+    for form in (padded, json.dumps(padded)):
+        record = _record(
+            "modify_gmail_message_labels",
+            {"message_id": SECRETS[1], "add_label_ids": form},
+        )
+        assert record["trash"] is True and "TRASH" in record["add"]
+        assert SECRETS[3] not in json.dumps(record)
+    for loose in ("true", " True ", "yes", 1, 1.0):
         record = _record(
             "update_drive_file", {"file_id": "1AbCdEfDriveFile", "trashed": loose}
         )
         assert record["flags"] == {"trashed": True} and record["trash"] is True
-    for loose in ("false", "0", 0):
+    for loose in ("false", "0", 0, 0.0):
         record = _record(
             "update_drive_file", {"file_id": "1AbCdEfDriveFile", "trashed": loose}
         )
@@ -398,6 +420,11 @@ async def test_an_unresolved_tool_leaves_no_name_and_nothing_from_its_arguments(
         ("manage_event", "Clear_Completed", "clear_completed"),
         ("manage_event", "delete everything; " + SECRETS[2], "?"),
         ("manage_event", "this_is_far_too_long_to_be_an_action", "?"),
+        # a plain-string action is checked against the server's own action words:
+        # a word that merely looks like one is caller text
+        ("manage_event", "secret_project_orchid", "?"),
+        ("manage_event", "budget", "?"),
+        ("manage_event", "move", "move"),
         ("manage_event", 7, "?"),
         ("manage_event", ["delete"], "?"),
     ],
@@ -474,12 +501,41 @@ async def test_a_cancelled_call_is_recorded_and_still_cancels(tmp_path):
 
 @pytest.mark.asyncio
 async def test_a_failed_write_never_fails_the_tool(tmp_path, caplog, monkeypatch):
-    audit_log = AuditLog(str(tmp_path / "audit.log"))
-    monkeypatch.setattr(audit_log_module.os, "write", lambda fd, data: len(data) - 1)
+    path = tmp_path / "audit.log"
+    audit_log = AuditLog(str(path))
+    real_write = os.write
+    sizes = []
+
+    def short_then_whole(fd, data):
+        # the first call takes one byte, as a nearly full disk would
+        sizes.append(len(data))
+        return real_write(fd, bytes(data[:1]) if len(sizes) == 1 else bytes(data))
+
+    monkeypatch.setattr(audit_log_module.os, "write", short_then_whole)
+    assert await _call(audit_log, "list_calendars", {}) == "ran"
+    monkeypatch.undo()
+    assert len(sizes) == 2  # the rest of the line followed
+    assert [line["tool"] for line in _lines(path)] == ["list_calendars"]
+
+    state = {"calls": 0}
+
+    def prefix_then_fail(fd, data):
+        # three bytes reach the file, then the disk is full
+        state["calls"] += 1
+        if state["calls"] == 1:
+            return real_write(fd, bytes(data[:3]))
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(audit_log_module.os, "write", prefix_then_fail)
     with caplog.at_level("WARNING"):
         assert await _call(audit_log, "list_calendars", {}) == "ran"
-    assert "cut short" in caplog.text
+    assert "Audit log write failed (OSError)" in caplog.text
     monkeypatch.undo()
+    # the next record must not be glued to the torn one
+    assert await _call(audit_log, "list_calendars", {}) == "ran"
+    raw = path.read_text(encoding="utf-8").splitlines()
+    assert len(raw) == 3 and len(raw[1]) == 3
+    assert json.loads(raw[2])["tool"] == "list_calendars"
 
     audit_log.close()  # the next write hits a closed descriptor
     with caplog.at_level("WARNING"):
@@ -492,12 +548,59 @@ async def test_a_broken_record_never_fails_the_tool(tmp_path, caplog, monkeypatc
     def boom(*args, **kwargs):
         raise ValueError(SECRETS[2])
 
-    audit_log = AuditLog(str(tmp_path / "audit.log"))
-    monkeypatch.setattr(audit_log_module, "build_record", boom)
+    path = tmp_path / "audit.log"
+    audit_log = AuditLog(str(path))
+    real_build = build_record
+
+    def boom_once(tool, *args, **kwargs):
+        if tool is not None:  # the fallback call names no tool
+            boom()
+        return real_build(tool, *args, **kwargs)
+
+    monkeypatch.setattr(audit_log_module, "build_record", boom_once)
     with caplog.at_level("WARNING"):
-        assert await _call(audit_log, "list_calendars", {}) == "ran"
+        assert await _call(audit_log, "list_calendars", {"x": SECRETS[2]}) == "ran"
     assert "Audit log record failed (ValueError)" in caplog.text
     assert SECRETS[2] not in caplog.text
+    monkeypatch.undo()
+    audit_log.close()
+    # the call still left its line, with nothing taken from the arguments
+    (record,) = _lines(path)
+    assert record["tool"] == "?" and record["ok"] is True
+    assert record["audit_err"] == "ValueError"
+    assert SECRETS[2] not in path.read_text(encoding="utf-8")
+
+
+def test_an_id_with_a_lone_surrogate_does_not_cost_the_record():
+    record = _record("modify_gmail_message_labels", {"message_id": "\ud800abcdefgh"})
+    assert record["items"] == 1 and len(record["ids"][0]) == 12
+    json.dumps(record)
+
+
+@pytest.mark.asyncio
+async def test_a_call_cancelled_during_the_tool_lookup_is_recorded(tmp_path):
+    path = tmp_path / "audit.log"
+    audit_log = AuditLog(str(path))
+
+    def cancelled(name):
+        raise asyncio.CancelledError()
+
+    with pytest.raises(asyncio.CancelledError):
+        await _call(audit_log, "list_calendars", {}, lookup=cancelled)
+    audit_log.close()
+    (record,) = _lines(path)
+    assert record["ok"] is False and record["err"] == "CancelledError"
+    assert record["tool"] == "?"
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="needs a FIFO")
+def test_a_path_that_is_not_a_regular_file_is_refused(tmp_path):
+    fifo = tmp_path / "audit.log"
+    os.mkfifo(fifo)
+    with pytest.raises(AuditLogConfigError):  # and it must not hang
+        AuditLog(str(fifo))
+    with pytest.raises(AuditLogConfigError):
+        AuditLog("/dev/null")
 
 
 # --- through a real server ------------------------------------------------------
@@ -555,7 +658,10 @@ async def test_end_to_end_with_real_argument_coercion(tmp_path):
     audit_log.close()
 
     lines = _lines(path)
-    batch, update, refused, invented = lines[:4]
+    assert len(lines) == 5  # the call to a tool that does not exist leaves one too
+    batch, update, refused, invented, unknown = lines
+    assert unknown["tool"] == "?" and unknown["ok"] is False
+    assert "args" not in unknown and "ids" not in unknown
     assert batch["tool"] == "batch_modify" and batch["items"] == 2
     assert batch["add"] == ["TRASH"] and batch["trash"] is True and batch["ok"] is True
     assert update["flags"] == {"trashed": True} and update["trash"] is True
