@@ -84,8 +84,9 @@ _SYSTEM_LABELS = frozenset(
     }
 )
 # The action words this server's tools act on. A tool that declares ``action`` as
-# a plain string (no enum) is checked against this list instead: a word that is
-# not here is caller text and is written as "?".
+# a plain string (no enum) is checked against this list, and against the words
+# the tool's own parameter description quotes (see _action); a word from neither
+# is caller text and is written as "?".
 _KNOWN_ACTIONS = frozenset(
     {
         "clear_completed",
