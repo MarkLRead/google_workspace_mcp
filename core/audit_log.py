@@ -99,6 +99,8 @@ _KNOWN_ACTIONS = frozenset(
         "populate_from_markdown",
         "rename",
         "reorder",
+        "reply",  # the comment tools (core/comments.py) describe no actions
+        "resolve",
         "revoke",
         "transfer_owner",
         "unhide",

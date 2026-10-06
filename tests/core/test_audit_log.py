@@ -437,9 +437,11 @@ def test_an_action_the_tool_itself_describes_is_recorded():
     assert action("rsvp") == "?" and action("delete") == "delete"
 
 
-def test_every_plain_string_action_of_the_real_tools_is_recognised():
-    """The real tools: each action word their docstrings name in quotes must be
-    recorded by name, not as "?" (rsvp was, before this test)."""
+def test_the_action_words_in_the_tool_docstrings_are_recognised():
+    """From the SOURCE of the tool modules (not the served schemas): every action
+    word a tool's docstring quotes for its ``action`` argument, on that line or
+    the lines that continue it, is recorded by name and not as "?" (rsvp was,
+    before this test). The set is pinned: a new action word must be looked at."""
     import re
     from pathlib import Path
 
@@ -452,15 +454,45 @@ def test_every_plain_string_action_of_the_real_tools_is_recognised():
             match = line_re.match(line)
             if not match or "Literal[" in line:
                 continue
-            text = " ".join([match.group(1)] + lines[number + 1 : number + 4])
+            more = []
+            for following in lines[number + 1 : number + 9]:
+                if (
+                    re.match(r"^\s+\w+(?: \([^)]*\))?: ", following)
+                    or not following.strip()
+                ):
+                    break  # the next argument, or the end of the block
+                more.append(following)
+            text = " ".join([match.group(1)] + more)
             schema = {"type": "string", "description": text}
-            for word in re.findall(r'"([a-z_]{1,24})"', match.group(1)):
+            for word in re.findall(r'"([a-z_]{1,24})"', text):
                 found.add(word)
                 record = build_record(
                     "t", {"action": word}, {"action": schema}, True, None, 1
                 )
                 assert record["action"] == word, (path.name, word)
-    assert {"rsvp", "list", "create", "delete"} <= found
+    assert found == {
+        "add",
+        "clear_completed",
+        "create",
+        "delete",
+        "grant",
+        "grant_batch",
+        "hide",
+        "list",
+        "modify_members",
+        "move",
+        "populate_from_markdown",
+        "rename",
+        "reorder",
+        "revoke",
+        "rsvp",
+        "transfer_owner",
+        "unhide",
+        "update",
+    }
+    # the comment tools describe no actions; their words are on the fixed list
+    for word in ("reply", "resolve"):
+        assert _record("manage_event", {"action": word})["action"] == word
 
 
 @pytest.mark.parametrize(
