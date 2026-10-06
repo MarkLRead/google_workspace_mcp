@@ -50,6 +50,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import stat
 import time
 from datetime import datetime, timezone
@@ -104,6 +105,9 @@ _KNOWN_ACTIONS = frozenset(
         "update",
     }
 )
+# A lower-case word in double quotes, as the tools' own parameter descriptions
+# name their actions.
+_QUOTED_WORD_RE = re.compile(r'"([a-z_]{1,24})"')
 _TRUE = frozenset({"true", "t", "yes", "y", "on", "1"})
 _FALSE = frozenset({"false", "f", "no", "n", "off", "0"})
 _MAX_NAMES = 40
@@ -177,7 +181,15 @@ def _action(value: Any, schema: Any) -> str:
     if isinstance(allowed, list):
         known = {item.casefold() for item in allowed if isinstance(item, str)}
         return text if text in known else "?"
-    return text if text in _KNOWN_ACTIONS else "?"
+    if text in _KNOWN_ACTIONS:
+        return text
+    # A plain-string action: the tool's OWN description of the parameter names
+    # its actions in quotes ('"create", "update", "delete", or "rsvp"'). That
+    # text is the server's, never the caller's, so a word quoted there is safe.
+    described = schema.get("description") if isinstance(schema, dict) else None
+    if isinstance(described, str) and text in _QUOTED_WORD_RE.findall(described):
+        return text
+    return "?"
 
 
 def _labels(value: Any) -> Optional[List[str]]:

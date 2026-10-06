@@ -411,6 +411,58 @@ async def test_an_unresolved_tool_leaves_no_name_and_nothing_from_its_arguments(
     assert "hunter2" not in text and SECRETS[2] not in text
 
 
+def test_an_action_the_tool_itself_describes_is_recorded():
+    """A plain-string action is also accepted when the tool's own description of
+    the parameter names it in quotes: that text is the server's, not the caller's."""
+    declared = {
+        "action": {
+            "type": "string",
+            "description": 'Action to perform - "create", "update", "delete", or "rsvp".',
+        },
+        "event_id": _OPT_STR,
+    }
+
+    def action(value):
+        return build_record("manage_event", {"action": value}, declared, True, None, 1)[
+            "action"
+        ]
+
+    assert action("rsvp") == "rsvp" and action(" RSVP ") == "rsvp"
+    assert action("create") == "create"
+    assert action("budget") == "?"  # not named by the tool
+    assert action("action") == "?" and action("to") == "?"  # unquoted words there
+    assert action('"rsvp"') == "?"
+    # a description that is not a string, or absent, falls back to the fixed list
+    declared["action"]["description"] = ["rsvp"]
+    assert action("rsvp") == "?" and action("delete") == "delete"
+
+
+def test_every_plain_string_action_of_the_real_tools_is_recognised():
+    """The real tools: each action word their docstrings name in quotes must be
+    recorded by name, not as "?" (rsvp was, before this test)."""
+    import re
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[2]
+    line_re = re.compile(r"^\s+action(?: \(str\))?: (.*)$")
+    found = set()
+    for path in root.glob("g*/*_tools.py"):
+        lines = path.read_text(encoding="utf-8").splitlines()
+        for number, line in enumerate(lines):
+            match = line_re.match(line)
+            if not match or "Literal[" in line:
+                continue
+            text = " ".join([match.group(1)] + lines[number + 1 : number + 4])
+            schema = {"type": "string", "description": text}
+            for word in re.findall(r'"([a-z_]{1,24})"', match.group(1)):
+                found.add(word)
+                record = build_record(
+                    "t", {"action": word}, {"action": schema}, True, None, 1
+                )
+                assert record["action"] == word, (path.name, word)
+    assert {"rsvp", "list", "create", "delete"} <= found
+
+
 @pytest.mark.parametrize(
     "tool,value,expected",
     [
