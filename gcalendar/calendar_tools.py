@@ -6,6 +6,7 @@ This module provides MCP tools for interacting with Google Calendar API.
 
 import datetime
 import logging
+import os
 import asyncio
 import re
 import uuid
@@ -33,6 +34,17 @@ from core.server import server
 
 # Configure module logger
 logger = logging.getLogger(__name__)
+
+# Fork (market-pulse ticket #60): a server-wide switch that stops Google from emailing
+# invitations, updates and cancellations to guests, whatever the caller asks for.
+NO_INVITES_ENV = "WORKSPACE_MCP_CALENDAR_NO_INVITES"
+
+
+def _effective_send_updates(send_updates: str) -> str:
+    """Return "none" when WORKSPACE_MCP_CALENDAR_NO_INVITES=1, else the caller's value."""
+    if os.environ.get(NO_INVITES_ENV) == "1":
+        return "none"
+    return send_updates
 
 
 def _parse_reminders_json(
@@ -950,7 +962,7 @@ async def _create_event_impl(
                     body=event_body,
                     supportsAttachments=True,
                     conferenceDataVersion=conference_data_version,
-                    sendUpdates=send_updates,
+                    sendUpdates=_effective_send_updates(send_updates),
                 )
                 .execute()
             )
@@ -963,7 +975,7 @@ async def _create_event_impl(
                     calendarId=calendar_id,
                     body=event_body,
                     conferenceDataVersion=conference_data_version,
-                    sendUpdates=send_updates,
+                    sendUpdates=_effective_send_updates(send_updates),
                 )
                 .execute()
             )
@@ -1244,7 +1256,7 @@ async def _modify_event_impl(
                 body=event_body,
                 supportsAttachments=True,
                 conferenceDataVersion=1,
-                sendUpdates=send_updates,
+                sendUpdates=_effective_send_updates(send_updates),
             )
             .execute()
         )
@@ -1318,7 +1330,7 @@ async def _delete_event_impl(
             .delete(
                 calendarId=calendar_id,
                 eventId=event_id,
-                sendUpdates=send_updates,
+                sendUpdates=_effective_send_updates(send_updates),
             )
             .execute()
         )
@@ -1376,7 +1388,7 @@ async def _rsvp_event_impl(
                 calendarId=calendar_id,
                 eventId=event_id,
                 body={"attendees": updated_attendees},
-                sendUpdates=send_updates,
+                sendUpdates=_effective_send_updates(send_updates),
             )
             .execute()
         )
