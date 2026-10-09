@@ -5,6 +5,7 @@ This module provides MCP tools for interacting with the Gmail API.
 """
 
 import logging
+import os
 import asyncio
 import base64
 import binascii
@@ -17,9 +18,10 @@ from pathlib import Path
 from typing import Annotated, Optional, List, Dict, Literal, Any, Union
 from urllib.parse import unquote, urlparse, urlunsplit
 
+from email import message_from_bytes
 from email.message import EmailMessage
 from email.policy import SMTP
-from email.utils import formataddr
+from email.utils import formataddr, getaddresses
 
 import httpx
 from fastmcp.exceptions import ToolError as ToolExecutionError
@@ -2414,6 +2416,43 @@ async def get_gmail_attachment_content(
         return "\n".join(result_lines)
 
 
+# Fork (market-pulse ticket #60): an optional fixed list of addresses this server may send to.
+SEND_ALLOWLIST_ENV = "WORKSPACE_MCP_SEND_ALLOWLIST"
+
+
+def _enforce_send_allowlist(raw_message: str) -> None:
+    """Refuse the whole send unless every To, Cc and Bcc address is on the allowlist.
+
+    The list is the comma-separated WORKSPACE_MCP_SEND_ALLOWLIST in the server's env
+    file; no tool can change it. Unset means upstream behaviour (no restriction); set
+    but empty refuses every send. The check reads the finished MIME message, so
+    recipients derived from a thread (reply_all) and forwards are checked as well.
+    Addresses compare case-insensitively; "Name <addr>" forms are parsed.
+    """
+    configured = os.environ.get(SEND_ALLOWLIST_ENV)
+    if configured is None:
+        return
+    allowed = {a.strip().lower() for a in configured.split(",") if a.strip()}
+    msg = message_from_bytes(base64.urlsafe_b64decode(raw_message))
+    header_values = []
+    for header in ("To", "Cc", "Bcc"):
+        header_values.extend(str(v) for v in msg.get_all(header, []))
+    recipients = getaddresses(header_values)
+    if not recipients:
+        raise UserInputError("Send refused: the message has no recipients.")
+    rejected = [
+        addr or name or "(unparseable address)"
+        for name, addr in recipients
+        if not addr or addr.strip().lower() not in allowed
+    ]
+    if rejected:
+        raise UserInputError(
+            "Send refused: not on this server's approved-recipient list: "
+            + ", ".join(rejected)
+            + ". Nothing was sent; save a draft instead with draft_gmail_message."
+        )
+
+
 @server.tool(
     title="Send Gmail Message",
     annotations=ToolAnnotations(
@@ -2817,6 +2856,7 @@ async def send_gmail_message(
             f"{details}"
         )
 
+    _enforce_send_allowlist(raw_message)
     send_body = {"raw": raw_message}
 
     # Associate with thread if provided
@@ -2968,6 +3008,7 @@ async def _forward_gmail_message_impl(
             f"{attached_count}/{len(attachments_to_send)} attached.{details}"
         )
 
+    _enforce_send_allowlist(raw_message)
     send_body = {"raw": raw_message}
 
     # Send the message
