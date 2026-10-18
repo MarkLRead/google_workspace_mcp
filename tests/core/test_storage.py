@@ -226,7 +226,7 @@ class TestConsistency:
         source = inspect.getsource(server_module.configure_server_for_http)
         # The server opens the disk store through auth/oauth_proxy_storage
         # (shared with core/export_contacts.py), which uses the factory.
-        assert "encrypted_disk_store" in source
+        assert "client_storage = encrypted_disk_store(" in source
         helper = inspect.getsource(proxy_storage.encrypted_disk_store)
         assert "make_sanitized_file_store" in helper
         # Must NOT contain the old inline pattern

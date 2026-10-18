@@ -340,6 +340,72 @@ def test_a_failed_page_prints_nothing_and_no_secret_anywhere(instance, monkeypat
     assert json.loads(record.strip())["err"] == "google"
 
 
+def test_a_people_api_403_is_google_failing_not_the_grant():
+    g = _google_with([_Resp(403)])
+    with pytest.raises(ec.ExportError) as err:
+        g.get(ec.CONNECTIONS_URL)
+    assert err.value.code == ec.EXIT_GOOGLE and g.slept == []
+    with pytest.raises(ec.CredentialRejected):
+        _google_with([_Resp(403)]).get(ec.USERINFO_URL)
+
+
+def test_a_refusal_during_the_sessions_own_refresh_is_a_credential_refusal():
+    from google.auth.exceptions import RefreshError
+
+    with pytest.raises(ec.CredentialRejected):
+        _google_with([RefreshError("invalid_grant")]).get(ec.CONNECTIONS_URL)
+
+
+def test_an_unnamed_user_group_is_kept_as_unresolved():
+    names = ec.group_name_map([
+        {"resourceName": "contactGroups/u", "groupType": "USER_CONTACT_GROUP"},
+        {"resourceName": "contactGroups/starred", "groupType": "SYSTEM_CONTACT_GROUP", "name": "starred"},
+    ])
+    person = {"memberships": [
+        {"contactGroupMembership": {"contactGroupResourceName": "contactGroups/u"}},
+        {"contactGroupMembership": {"contactGroupResourceName": "contactGroups/starred"}},
+    ]}
+    c = ec.shape_contact(person, names)
+    assert c["groups"] == [] and c["groups_unresolved"] == ["contactGroups/u"]
+
+
+def test_no_audit_log_configured_means_no_export(instance, monkeypatch):
+    d, _ = instance
+    asyncio.run(_put(str(d), _key(), _grant(_tid(1))))
+    monkeypatch.delenv("WORKSPACE_MCP_AUDIT_LOG")
+    with pytest.raises(ec.ExportError) as err:
+        ec.run(False, out=io.StringIO())
+    assert err.value.code == ec.EXIT_CONFIG and err.value.tag == "audit"
+
+
+def test_a_failed_audit_write_prints_nothing(instance, monkeypatch):
+    d, _ = instance
+    asyncio.run(_put(str(d), _key(), _grant(_tid(1))))
+    _wire(monkeypatch, [None], [_script_ok()])
+    import core.audit_log as al
+
+    monkeypatch.setattr(al.AuditLog, "write", lambda self, record: False)
+    out = io.StringIO()
+    with pytest.raises(ec.ExportError) as err:
+        ec.run(False, out=out)
+    assert err.value.tag == "audit" and out.getvalue() == ""
+
+
+def test_an_unforeseen_error_is_audited_and_exits_4(instance, monkeypatch, capsys):
+    d, audit = instance
+    asyncio.run(_put(str(d), _key(), _grant(_tid(1))))
+    _wire(monkeypatch, [None], [{ec.USERINFO_URL: [RuntimeError("boom " + SECRET_TEXT)]}])
+    assert ec.main([]) == ec.EXIT_CONFIG
+    assert SECRET_TEXT not in capsys.readouterr().err
+    assert json.loads(audit.read_text().strip())["err"] == "internal"
+
+
+def test_a_usage_error_exits_4_not_2(capsys):
+    with pytest.raises(SystemExit) as stop:
+        ec.main([""])
+    assert stop.value.code == ec.EXIT_CONFIG
+
+
 def test_check_mode_counts_without_calling_google(instance, monkeypatch):
     d, _ = instance
     asyncio.run(_put(str(d), _key(), _grant(_tid(1))))

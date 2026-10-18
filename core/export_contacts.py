@@ -194,12 +194,16 @@ class Google:
 
     def get(self, url: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         import requests
+        from google.auth.exceptions import RefreshError, TransportError
 
         delays = list(RETRY_DELAYS_S)
         while True:
             try:
                 resp = self.session.get(url, params=params, timeout=TIMEOUT_S)
-            except requests.RequestException:
+            except RefreshError:
+                # AuthorizedSession refreshes by itself on a 401; a refusal there is this grant dying mid-run
+                raise CredentialRejected() from None
+            except (requests.RequestException, TransportError):
                 status = None
             else:
                 status = resp.status_code
@@ -211,7 +215,9 @@ class Google:
                     if not isinstance(data, dict):
                         raise ExportError(EXIT_GOOGLE, "bad_json", "Google sent a reply that is not an object")
                     return data
-                if status in (401, 403):
+                # 401: the grant is refused. 403 on the identity call: no right to read it with this grant.
+                # A 403 from the People API (quota, API off) is Google failing, not the grant: exit 3.
+                if status == 401 or (status == 403 and url == USERINFO_URL):
                     raise CredentialRejected()
             if (status is None or status == 429 or status >= 500) and delays:
                 self.sleep(delays.pop(0))
@@ -289,32 +295,34 @@ def shape_contact(person: Dict[str, Any], group_names: Dict[str, str]) -> Dict[s
         rn = (m.get("contactGroupMembership") or {}).get("contactGroupResourceName")
         if not isinstance(rn, str):
             continue
-        if rn in group_names:
-            if group_names[rn]:
-                contact["groups"].append(group_names[rn])
-        else:
-            unresolved.append(rn)
+        if rn not in group_names:
+            unresolved.append(rn)  # a group the list did not return: kept as its id, never dropped
+        elif group_names[rn] is None:
+            unresolved.append(rn)  # a user group without a name
+        elif group_names[rn]:
+            contact["groups"].append(group_names[rn])
+        # "" = a system group (myContacts, starred): known, not a label
     if unresolved:
         contact["groups_unresolved"] = sorted(unresolved)
     return contact
 
 
-def group_name_map(groups: List[Dict[str, Any]]) -> Dict[str, str]:
-    """User groups by resource name; system groups map to "" (known, not a label)."""
-    out: Dict[str, str] = {}
+def group_name_map(groups: List[Dict[str, Any]]) -> Dict[str, Optional[str]]:
+    """User groups by resource name (None when unnamed); system groups map to "" (known, not a label)."""
+    out: Dict[str, Optional[str]] = {}
     for g in groups:
         rn = g.get("resourceName")
         if not isinstance(rn, str):
             continue
         if g.get("groupType") == "USER_CONTACT_GROUP":
-            out[rn] = g.get("name") or g.get("formattedName") or ""
+            out[rn] = g.get("name") or g.get("formattedName") or None
         else:
             out[rn] = ""
     return out
 
 
 def build_snapshot(google: Google, who: Dict[str, str]) -> Dict[str, Any]:
-    groups = google.pages(GROUPS_URL, {"pageSize": PAGE_SIZE, "groupFields": "name,groupType"}, "contactGroups")
+    groups = google.pages(GROUPS_URL, {"pageSize": PAGE_SIZE, "groupFields": "name,formattedName,groupType"}, "contactGroups")
     people = google.pages(
         CONNECTIONS_URL, {"pageSize": PAGE_SIZE, "personFields": PERSON_FIELDS}, "connections"
     )
@@ -361,12 +369,21 @@ def _config() -> Tuple[str, str, str, bytes]:
     return allowed[0], config.client_id, config.client_secret, jwt_key
 
 
-def _audit(ok: bool, started: float, items: Optional[int], err: Optional[str]) -> None:
-    from core.audit_log import load_audit_log
+def _open_audit():
+    """The instance's audit log. Required: an export that leaves no trace is not run."""
+    from core.audit_log import AuditLogConfigError, load_audit_log
 
-    log = load_audit_log()  # raises AuditLogConfigError when set but unusable
+    try:
+        log = load_audit_log()
+    except AuditLogConfigError:
+        raise ExportError(EXIT_CONFIG, "audit", "the audit log cannot be opened for append") from None
     if log is None:
-        return
+        raise ExportError(EXIT_CONFIG, "audit", "WORKSPACE_MCP_AUDIT_LOG is not set; nothing is exported untraced")
+    return log
+
+
+def _audit(ok: bool, started: float, items: Optional[int], err: Optional[str]) -> None:
+    log = _open_audit()
     record: Dict[str, Any] = {
         "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "tool": TOOL,
@@ -379,23 +396,22 @@ def _audit(ok: bool, started: float, items: Optional[int], err: Optional[str]) -
     if err:
         record["err"] = err
     try:
-        log.write(record)
+        written = log.write(record)
     finally:
         log.close()
+    if not written:
+        raise ExportError(EXIT_CONFIG, "audit", "the audit line could not be written; nothing printed")
 
 
-def run(check_only: bool, out=sys.stdout, sleep: Callable[[float], None] = time.sleep) -> int:
+def run(check_only: bool, out=None, sleep: Callable[[float], None] = time.sleep) -> int:
     from auth.oauth_proxy_storage import disk_directory, encrypted_disk_store
 
+    out = out if out is not None else sys.stdout  # resolved at call time (tests replace sys.stdout)
     started = time.monotonic()
     allowed, client_id, client_secret, jwt_key = _config()
     directory = disk_directory()
     check_store(directory)
-    from core.audit_log import load_audit_log
-
-    probe = load_audit_log()  # an audit log that was asked for must open, before Google is called
-    if probe is not None:
-        probe.close()
+    _open_audit().close()  # the audit log must open before Google is called
 
     store = encrypted_disk_store(directory, jwt_key)
     grants, skipped = asyncio.run(read_grants(store, list_grant_keys(directory)))
@@ -423,7 +439,11 @@ def run(check_only: bool, out=sys.stdout, sleep: Callable[[float], None] = time.
             out.flush()
             return EXIT_OK
     except ExportError as exc:
-        _audit(False, started, None, exc.tag)
+        if exc.tag != "audit":
+            _audit(False, started, None, exc.tag)
+        raise
+    except Exception:  # anything unforeseen still leaves its trace, then the generic exit
+        _audit(False, started, None, "internal")
         raise
     _audit(False, started, None, "no_grant")
     raise ExportError(
@@ -432,7 +452,12 @@ def run(check_only: bool, out=sys.stdout, sleep: Callable[[float], None] = time.
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    parser = argparse.ArgumentParser(prog="python -m core.export_contacts", description=__doc__.split("\n")[0])
+    class _Parser(argparse.ArgumentParser):
+        def error(self, message):  # a usage error is configuration (4), never "no usable grant" (argparse's 2)
+            print(f"export_contacts: usage: {message}", file=sys.stderr)
+            sys.exit(EXIT_CONFIG)
+
+    parser = _Parser(prog="python -m core.export_contacts", description=__doc__.split("\n")[0])
     parser.add_argument("--check", action="store_true", help="counts of usable grants only; no Google call")
     args = parser.parse_args(argv)
     logging.basicConfig(stream=sys.stderr, level=logging.WARNING, format="export_contacts: %(levelname)s %(message)s")
