@@ -22,7 +22,7 @@ from auth.oauth_proxy_storage import (
 SIGNING = "fixture-key-material-0123"
 ALLOWED = "owner@example.com"
 REFRESH_FIXTURE = "FIXTURE-REFRESH-0001"
-ACCESS_FIXTURE = "FIXTURE-ACCESS-0002"
+ACCESS_FIXTURE = "FIXTURE-ACCESS-NODIGITS"
 CONTACTS = "https://www.googleapis.com/auth/contacts"
 
 
