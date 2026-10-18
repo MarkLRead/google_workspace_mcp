@@ -501,35 +501,18 @@ def configure_server_for_http():
                 "the code exchange."
             )
 
-        def validate_and_derive_jwt_key(
-            jwt_signing_key_override: str | None, client_secret: str | None
-        ) -> bytes:
-            """Validate JWT signing key override and derive the final JWT key."""
-            if jwt_signing_key_override:
-                if len(jwt_signing_key_override) < 12:
-                    logger.warning(
-                        "OAuth 2.1: FASTMCP_SERVER_AUTH_GOOGLE_JWT_SIGNING_KEY is less than 12 characters; "
-                        "use a longer secret to improve key derivation strength."
-                    )
-                return derive_jwt_key(
-                    low_entropy_material=jwt_signing_key_override,
-                    salt="fastmcp-jwt-signing-key",
-                )
-            if client_secret:
-                return derive_jwt_key(
-                    high_entropy_material=client_secret,
-                    salt="fastmcp-jwt-signing-key",
-                )
-            raise ValueError(
-                "Public client OAuth 2.1 requires FASTMCP_SERVER_AUTH_GOOGLE_JWT_SIGNING_KEY "
-                "when GOOGLE_OAUTH_CLIENT_SECRET is not set."
-            )
-
         try:
             # Import common dependencies for storage backends
             from key_value.aio.wrappers.encryption import FernetEncryptionWrapper
             from cryptography.fernet import Fernet
-            from fastmcp.server.auth.jwt_issuer import derive_jwt_key
+
+            # Shared with offline commands (core/export_contacts.py): one derivation.
+            from auth.oauth_proxy_storage import (
+                derive_storage_encryption_key,
+                disk_directory as oauth_proxy_disk_directory,
+                encrypted_disk_store,
+                validate_and_derive_jwt_key,
+            )
 
             provider_valid_scopes: List[str] = sorted(get_current_scopes())
             provider_required_scopes: List[str] = sorted(PROTOCOL_AUTH_SCOPES)
@@ -648,9 +631,8 @@ def configure_server_for_http():
                         jwt_signing_key_override, config.client_secret
                     )
 
-                    storage_encryption_key = derive_jwt_key(
-                        high_entropy_material=jwt_signing_key.decode(),
-                        salt="fastmcp-storage-encryption-key",
+                    storage_encryption_key = derive_storage_encryption_key(
+                        jwt_signing_key
                     )
 
                     client_storage = FernetEncryptionWrapper(
@@ -691,35 +673,15 @@ def configure_server_for_http():
                     )
             elif use_disk:
                 try:
-                    from core.storage import make_sanitized_file_store
-
-                    disk_directory = os.getenv(
-                        "WORKSPACE_MCP_OAUTH_PROXY_DISK_DIRECTORY", ""
-                    ).strip()
-                    if not disk_directory:
-                        # Default to FASTMCP_HOME/oauth-proxy or ~/.fastmcp/oauth-proxy
-                        fastmcp_home = os.getenv("FASTMCP_HOME", "").strip()
-                        if fastmcp_home:
-                            disk_directory = os.path.join(fastmcp_home, "oauth-proxy")
-                        else:
-                            disk_directory = os.path.expanduser(
-                                "~/.fastmcp/oauth-proxy"
-                            )
-
-                    client_storage = make_sanitized_file_store(disk_directory)
+                    # Default to FASTMCP_HOME/oauth-proxy or ~/.fastmcp/oauth-proxy
+                    disk_directory = oauth_proxy_disk_directory()
 
                     jwt_signing_key = validate_and_derive_jwt_key(
                         jwt_signing_key_override, config.client_secret
                     )
 
-                    storage_encryption_key = derive_jwt_key(
-                        high_entropy_material=jwt_signing_key.decode(),
-                        salt="fastmcp-storage-encryption-key",
-                    )
-
-                    client_storage = FernetEncryptionWrapper(
-                        key_value=client_storage,
-                        fernet=Fernet(key=storage_encryption_key),
+                    client_storage = encrypted_disk_store(
+                        disk_directory, jwt_signing_key
                     )
                     logger.info(
                         "OAuth 2.1: Using FileTreeStore for FastMCP OAuth proxy client_storage (directory=%s)",
