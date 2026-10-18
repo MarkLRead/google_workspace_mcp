@@ -19,9 +19,9 @@ from auth.oauth_proxy_storage import (
     validate_and_derive_jwt_key,
 )
 
-SIGNING = "a-test-signing-key-long-enough"
+SIGNING = "fixture-key-material-0123"
 ALLOWED = "owner@example.com"
-SECRET_TEXT = "1//REFRESH-SECRET-DO-NOT-PRINT"
+SECRET_TEXT = "FIXTURE-REFRESH-0001"
 CONTACTS = "https://www.googleapis.com/auth/contacts"
 
 
@@ -32,7 +32,7 @@ def _grant(token_id, scope=CONTACTS + " openid email", refresh=SECRET_TEXT, crea
     now = time.time()
     return UpstreamTokenSet(
         upstream_token_id=token_id,
-        access_token="ya29.ACCESS-SECRET",
+        access_token="FIXTURE-ACCESS-0002",
         refresh_token=refresh,
         refresh_token_expires_at=None,
         expires_at=now + 3600,
@@ -106,7 +106,7 @@ def test_key_helper_matches_the_old_inline_derivation():
 def test_store_written_by_the_proxy_is_read_back_and_bad_grants_are_skipped(tmp_path):
     d = str(tmp_path)
     key = _key()
-    other_key = validate_and_derive_jwt_key("a-different-signing-key-xx", None)
+    other_key = validate_and_derive_jwt_key("fixture-other-material-9", None)
 
     async def scenario():
         await _put(d, key, _grant(_tid(1), created=100))
@@ -265,7 +265,7 @@ def instance(tmp_path, monkeypatch):
     monkeypatch.setenv("FASTMCP_SERVER_AUTH_GOOGLE_JWT_SIGNING_KEY", SIGNING)
     monkeypatch.setenv("WORKSPACE_MCP_ALLOWED_EMAILS", ALLOWED)
     monkeypatch.setenv("GOOGLE_OAUTH_CLIENT_ID", "cid.apps.googleusercontent.com")
-    monkeypatch.setenv("GOOGLE_OAUTH_CLIENT_SECRET", "client-secret-value")
+    monkeypatch.setenv("GOOGLE_OAUTH_CLIENT_SECRET", "fixture-client-cs")
     monkeypatch.setenv("WORKSPACE_MCP_AUDIT_LOG", str(audit))
     import auth.oauth_config as oc
 
@@ -336,7 +336,7 @@ def test_a_failed_page_prints_nothing_and_no_secret_anywhere(instance, monkeypat
     err = capsys.readouterr().err
     record = audit.read_text()
     for text in (err, record):
-        assert SECRET_TEXT not in text and "ya29." not in text and SIGNING not in text
+        assert SECRET_TEXT not in text and "FIXTURE-ACCESS" not in text and SIGNING not in text
     assert json.loads(record.strip())["err"] == "google"
 
 
