@@ -21,18 +21,19 @@ from auth.oauth_proxy_storage import (
 
 SIGNING = "fixture-key-material-0123"
 ALLOWED = "owner@example.com"
-SECRET_TEXT = "FIXTURE-REFRESH-0001"
+REFRESH_FIXTURE = "FIXTURE-REFRESH-0001"
+ACCESS_FIXTURE = "FIXTURE-ACCESS-0002"
 CONTACTS = "https://www.googleapis.com/auth/contacts"
 
 
 # ---------------------------------------------------------------- helpers
 
 
-def _grant(token_id, scope=CONTACTS + " openid email", refresh=SECRET_TEXT, created=None):
+def _grant(token_id, scope=CONTACTS + " openid email", refresh=REFRESH_FIXTURE, created=None):
     now = time.time()
     return UpstreamTokenSet(
         upstream_token_id=token_id,
-        access_token="FIXTURE-ACCESS-0002",
+        access_token=ACCESS_FIXTURE,
         refresh_token=refresh,
         refresh_token_expires_at=None,
         expires_at=now + 3600,
@@ -336,7 +337,7 @@ def test_a_failed_page_prints_nothing_and_no_secret_anywhere(instance, monkeypat
     err = capsys.readouterr().err
     record = audit.read_text()
     for text in (err, record):
-        assert SECRET_TEXT not in text and "FIXTURE-ACCESS" not in text and SIGNING not in text
+        assert REFRESH_FIXTURE not in text and "FIXTURE-ACCESS" not in text and SIGNING not in text
     assert json.loads(record.strip())["err"] == "google"
 
 
@@ -394,9 +395,9 @@ def test_a_failed_audit_write_prints_nothing(instance, monkeypatch):
 def test_an_unforeseen_error_is_audited_and_exits_4(instance, monkeypatch, capsys):
     d, audit = instance
     asyncio.run(_put(str(d), _key(), _grant(_tid(1))))
-    _wire(monkeypatch, [None], [{ec.USERINFO_URL: [RuntimeError("boom " + SECRET_TEXT)]}])
+    _wire(monkeypatch, [None], [{ec.USERINFO_URL: [RuntimeError("boom " + REFRESH_FIXTURE)]}])
     assert ec.main([]) == ec.EXIT_CONFIG
-    assert SECRET_TEXT not in capsys.readouterr().err
+    assert REFRESH_FIXTURE not in capsys.readouterr().err
     assert json.loads(audit.read_text().strip())["err"] == "internal"
 
 
