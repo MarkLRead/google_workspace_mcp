@@ -174,13 +174,17 @@ def refresh(creds: Any) -> None:
     try:
         creds.refresh(_timed_request())
     except RefreshError as exc:
-        # invalid_grant and friends: this grant is dead, the next one may not be.
-        # A 5xx from the token endpoint also lands here; it says "retryable".
-        if getattr(exc, "retryable", False):
-            raise ExportError(EXIT_GOOGLE, "token_endpoint", "Google's token endpoint failed") from None
-        raise CredentialRejected() from None
+        raise refresh_failure(exc) from None
     except TransportError:
         raise ExportError(EXIT_GOOGLE, "network", "could not reach Google's token endpoint") from None
+
+
+def refresh_failure(exc: BaseException) -> Exception:
+    """One rule for every refresh (ours and the session's own after a 401): a retryable failure is Google failing
+    (exit 3, no other grant tried); anything else (invalid_grant and friends) is this grant refused."""
+    if getattr(exc, "retryable", False):
+        return ExportError(EXIT_GOOGLE, "token_endpoint", "Google's token endpoint failed")
+    return CredentialRejected()
 
 
 class Google:
@@ -200,9 +204,9 @@ class Google:
         while True:
             try:
                 resp = self.session.get(url, params=params, timeout=TIMEOUT_S)
-            except RefreshError:
-                # AuthorizedSession refreshes by itself on a 401; a refusal there is this grant dying mid-run
-                raise CredentialRejected() from None
+            except RefreshError as exc:
+                # AuthorizedSession refreshes by itself on a 401: the same rule as our own refresh
+                raise refresh_failure(exc) from None
             except (requests.RequestException, TransportError):
                 status = None
             else:
@@ -234,13 +238,16 @@ class Google:
             if token:
                 query["pageToken"] = token
             data = self.get(url, query)
-            page = data.get(items_key) or []
-            if not isinstance(page, list):
-                raise ExportError(EXIT_GOOGLE, "bad_json", "Google sent a list that is not a list")
-            items.extend(x for x in page if isinstance(x, dict))
+            # Strict: a malformed page fails the run; nothing is filtered into a shorter book.
+            page = data.get(items_key, [])  # absent = an empty result (Google omits empty lists)
+            if not isinstance(page, list) or not all(isinstance(x, dict) for x in page):
+                raise ExportError(EXIT_GOOGLE, "bad_json", "Google sent a page that is not a list of objects")
+            items.extend(page)
             token = data.get("nextPageToken")
-            if not token:
+            if token is None or token == "":
                 return items
+            if not isinstance(token, str):
+                raise ExportError(EXIT_GOOGLE, "bad_json", "Google sent a page token that is not text")
         raise ExportError(EXIT_GOOGLE, "page_cap", f"more than {MAX_PAGES} pages; nothing printed")
 
 
@@ -322,7 +329,7 @@ def group_name_map(groups: List[Dict[str, Any]]) -> Dict[str, Optional[str]]:
 
 
 def build_snapshot(google: Google, who: Dict[str, str]) -> Dict[str, Any]:
-    groups = google.pages(GROUPS_URL, {"pageSize": PAGE_SIZE, "groupFields": "name,formattedName,groupType"}, "contactGroups")
+    groups = google.pages(GROUPS_URL, {"pageSize": PAGE_SIZE, "groupFields": "name,groupType"}, "contactGroups")
     people = google.pages(
         CONNECTIONS_URL, {"pageSize": PAGE_SIZE, "personFields": PERSON_FIELDS}, "connections"
     )
@@ -353,6 +360,9 @@ def _config() -> Tuple[str, str, str, bytes]:
 
     if os.getenv(STORAGE_BACKEND_ENV, "").strip().lower() != "disk":
         raise ExportError(EXIT_CONFIG, "backend", "only the disk storage backend is supported")
+    if os.getenv("WORKSPACE_MCP_OAUTH_PROXY_VALKEY_HOST", "").strip():
+        # the server picks Valkey whenever a host is set, even with backend=disk: the disk store would be stale
+        raise ExportError(EXIT_CONFIG, "backend", "a Valkey host is set, so the server does not use the disk store")
     try:
         allowed = sorted(load_allowed_emails())
     except Exception:
@@ -404,48 +414,60 @@ def _audit(ok: bool, started: float, items: Optional[int], err: Optional[str]) -
 
 
 def run(check_only: bool, out=None, sleep: Callable[[float], None] = time.sleep) -> int:
-    from auth.oauth_proxy_storage import disk_directory, encrypted_disk_store
-
+    """One audit record per run, whatever happens after the audit log opens (check mode included)."""
     out = out if out is not None else sys.stdout  # resolved at call time (tests replace sys.stdout)
     started = time.monotonic()
+    _open_audit().close()  # first: an export that cannot leave a trace does not start
+    recorded = False
+
+    def record(ok: bool, items: Optional[int], err: Optional[str]) -> None:
+        nonlocal recorded
+        if not recorded:
+            recorded = True
+            _audit(ok, started, items, err)
+
+    try:
+        return _run(check_only, out, sleep, record)
+    except ExportError as exc:
+        if exc.tag != "audit":
+            record(False, None, exc.tag)
+        raise
+    except Exception:  # anything unforeseen still leaves its trace, then the generic exit
+        record(False, None, "internal")
+        raise
+
+
+def _run(check_only: bool, out, sleep: Callable[[float], None], record) -> int:
+    from auth.oauth_proxy_storage import disk_directory, encrypted_disk_store
+
     allowed, client_id, client_secret, jwt_key = _config()
     directory = disk_directory()
     check_store(directory)
-    _open_audit().close()  # the audit log must open before Google is called
-
     store = encrypted_disk_store(directory, jwt_key)
     grants, skipped = asyncio.run(read_grants(store, list_grant_keys(directory)))
     if skipped:
         print("export_contacts: skipped " + ", ".join(f"{k}={v}" for k, v in sorted(skipped.items())), file=sys.stderr)
     if check_only:
+        record(bool(grants), len(grants), None if grants else "no_grant")
         print(json.dumps({"usable_grants": len(grants), "skipped": skipped}, sort_keys=True), file=out)
         return EXIT_OK if grants else EXIT_NO_GRANT
 
     rejected = 0
-    try:
-        for grant in grants:
-            creds = credentials_for(grant, client_id, client_secret)
-            try:
-                refresh(creds)
-                google = Google(creds, sleep=sleep)
-                who = verified_account(google, allowed)
-                snapshot = build_snapshot(google, who)
-            except CredentialRejected:
-                rejected += 1
-                continue
-            text = json.dumps(snapshot, ensure_ascii=False, sort_keys=True)
-            _audit(True, started, snapshot["count"], None)
-            out.write(text + "\n")
-            out.flush()
-            return EXIT_OK
-    except ExportError as exc:
-        if exc.tag != "audit":
-            _audit(False, started, None, exc.tag)
-        raise
-    except Exception:  # anything unforeseen still leaves its trace, then the generic exit
-        _audit(False, started, None, "internal")
-        raise
-    _audit(False, started, None, "no_grant")
+    for grant in grants:
+        creds = credentials_for(grant, client_id, client_secret)
+        try:
+            refresh(creds)
+            google = Google(creds, sleep=sleep)
+            who = verified_account(google, allowed)
+            snapshot = build_snapshot(google, who)
+        except CredentialRejected:
+            rejected += 1
+            continue
+        text = json.dumps(snapshot, ensure_ascii=False, sort_keys=True)
+        record(True, snapshot["count"], None)  # the trace first; a failed write prints nothing
+        out.write(text + "\n")
+        out.flush()
+        return EXIT_OK
     raise ExportError(
         EXIT_NO_GRANT, "no_grant", f"no usable grant ({len(grants)} tried, {rejected} refused by Google)"
     )

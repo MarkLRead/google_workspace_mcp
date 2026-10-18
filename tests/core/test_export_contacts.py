@@ -407,6 +407,75 @@ def test_a_usage_error_exits_4_not_2(capsys):
     assert stop.value.code == ec.EXIT_CONFIG
 
 
+def test_groups_are_asked_with_the_documented_field_mask():
+    g = FakeGoogle({ec.GROUPS_URL: [{}], ec.CONNECTIONS_URL: [{}]})
+    snap = ec.build_snapshot(g, {"account": ALLOWED, "sub": "1"})
+    assert snap["count"] == 0  # an absent list is an empty book, not an error
+    assert g.calls[0][1]["groupFields"] == "name,groupType"
+
+
+@pytest.mark.parametrize("page", [
+    {"connections": [{"resourceName": "people/1"}, "not-an-object"]},
+    {"connections": {}},
+    {"connections": [], "nextPageToken": 5},
+])
+def test_a_malformed_page_fails_the_run(page):
+    g = FakeGoogle({ec.CONNECTIONS_URL: [page]})
+    with pytest.raises(ec.ExportError) as err:
+        g.pages(ec.CONNECTIONS_URL, {}, "connections")
+    assert err.value.code == ec.EXIT_GOOGLE and err.value.tag == "bad_json"
+
+
+def test_a_retryable_refresh_inside_the_session_is_google_failing_and_no_next_grant(instance, monkeypatch):
+    from google.auth.exceptions import RefreshError
+
+    d, audit = instance
+    asyncio.run(_put(str(d), _key(), _grant(_tid(1), created=100)))
+    asyncio.run(_put(str(d), _key(), _grant(_tid(2), created=200)))
+    tried = []
+    monkeypatch.setattr(ec, "refresh", lambda creds: tried.append(1))
+    err = RefreshError("token endpoint 503", retryable=True)  # google-auth's own form for a 5xx there
+    assert err.retryable is True
+    g = _google_with([err])
+    monkeypatch.setattr(ec, "Google", lambda creds, sleep=None: g)
+    out = io.StringIO()
+    with pytest.raises(ec.ExportError) as e:
+        ec.run(False, out=out)
+    assert e.value.code == ec.EXIT_GOOGLE and len(tried) == 1 and out.getvalue() == ""
+    assert json.loads(audit.read_text().strip())["err"] == "token_endpoint"
+
+
+def test_configuration_failures_and_check_mode_are_audited_once(instance, monkeypatch):
+    d, audit = instance
+    with pytest.raises(ec.ExportError):
+        ec.run(False, out=io.StringIO())  # no store yet
+    asyncio.run(_put(str(d), _key(), _grant(_tid(1))))
+    assert ec.run(True, out=io.StringIO()) == ec.EXIT_OK
+    lines = [json.loads(x) for x in audit.read_text().splitlines()]
+    assert [(x["ok"], x.get("err")) for x in lines] == [(False, "store"), (True, None)]
+
+
+def test_a_broken_stdout_after_the_trace_leaves_one_record(instance, monkeypatch):
+    d, audit = instance
+    asyncio.run(_put(str(d), _key(), _grant(_tid(1))))
+    _wire(monkeypatch, [None], [_script_ok()])
+
+    class Broken(io.StringIO):
+        def write(self, s):
+            raise OSError("pipe closed")
+
+    with pytest.raises(OSError):
+        ec.run(False, out=Broken())
+    assert len(audit.read_text().splitlines()) == 1
+
+
+def test_a_valkey_host_is_refused_even_with_backend_disk(instance, monkeypatch):
+    monkeypatch.setenv("WORKSPACE_MCP_OAUTH_PROXY_VALKEY_HOST", "localhost")
+    with pytest.raises(ec.ExportError) as err:
+        ec.run(True, out=io.StringIO())
+    assert err.value.tag == "backend"
+
+
 def test_check_mode_counts_without_calling_google(instance, monkeypatch):
     d, _ = instance
     asyncio.run(_put(str(d), _key(), _grant(_tid(1))))
