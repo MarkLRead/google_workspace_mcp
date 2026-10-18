@@ -220,9 +220,15 @@ class TestConsistency:
         """core.server must use make_sanitized_file_store, not inline config."""
         import inspect
 
+        import auth.oauth_proxy_storage as proxy_storage
         import core.server as server_module
 
         source = inspect.getsource(server_module.configure_server_for_http)
-        assert "make_sanitized_file_store" in source
+        # The server opens the disk store through auth/oauth_proxy_storage
+        # (shared with core/export_contacts.py), which uses the factory.
+        assert "encrypted_disk_store" in source
+        helper = inspect.getsource(proxy_storage.encrypted_disk_store)
+        assert "make_sanitized_file_store" in helper
         # Must NOT contain the old inline pattern
         assert "HybridSanitizationStrategy" not in source
+        assert "HybridSanitizationStrategy" not in helper
