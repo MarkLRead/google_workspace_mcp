@@ -18,7 +18,7 @@ from core.storage import make_sanitized_file_store
 
 logger = logging.getLogger(__name__)
 
-JWT_SIGNING_KEY_ENV = "FASTMCP_SERVER_AUTH_GOOGLE_JWT_SIGNING_KEY"
+SIGNING_MATERIAL_ENV = "FASTMCP_SERVER_AUTH_GOOGLE_JWT_SIGNING_KEY"
 DISK_DIRECTORY_ENV = "WORKSPACE_MCP_OAUTH_PROXY_DISK_DIRECTORY"
 STORAGE_BACKEND_ENV = "WORKSPACE_MCP_OAUTH_PROXY_STORAGE_BACKEND"
 
@@ -28,7 +28,7 @@ _STORAGE_SALT = "fastmcp-storage-encryption-key"
 
 def jwt_signing_key_override() -> Optional[str]:
     """The signing key from the environment, or None when unset or blank."""
-    return os.getenv(JWT_SIGNING_KEY_ENV, "").strip() or None
+    return os.getenv(SIGNING_MATERIAL_ENV, "").strip() or None
 
 
 def validate_and_derive_jwt_key(

@@ -48,7 +48,7 @@ CONTACT_SCOPES = (
 USERINFO_URL = "https://openidconnect.googleapis.com/v1/userinfo"
 CONNECTIONS_URL = "https://people.googleapis.com/v1/people/me/connections"
 GROUPS_URL = "https://people.googleapis.com/v1/contactGroups"
-TOKEN_URI = "https://oauth2.googleapis.com/token"
+GOOGLE_REFRESH_URL = "https://oauth2.googleapis.com/token"
 PERSON_FIELDS = "names,phoneNumbers,emailAddresses,organizations,memberships"
 PAGE_SIZE = 1000
 MAX_PAGES = 50  # 50,000 contacts; a household book is a few hundred
@@ -160,7 +160,7 @@ def credentials_for(grant: Any, client_id: str, client_secret: str):
     return Credentials(
         token=None,  # always refresh: proves the grant still works
         refresh_token=grant.refresh_token,
-        token_uri=TOKEN_URI,
+        token_uri=GOOGLE_REFRESH_URL,
         client_id=client_id,
         client_secret=client_secret,
         scopes=(grant.scope or "").split() or None,
