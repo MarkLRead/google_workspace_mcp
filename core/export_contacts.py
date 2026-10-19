@@ -420,9 +420,10 @@ def run(check_only: bool, out=None, sleep: Callable[[float], None] = time.sleep)
     _open_audit().close()  # first: an export that cannot leave a trace does not start
     recorded = False
 
-    def record(ok: bool, items: Optional[int], err: Optional[str]) -> None:
+    def record(ok: bool, items: Optional[int], err: Optional[str], again: bool = False) -> None:
+        # One outcome line per run; `again` only for "read, but not delivered" after a success line.
         nonlocal recorded
-        if not recorded:
+        if again or not recorded:
             recorded = True
             _audit(ok, started, items, err)
 
@@ -464,9 +465,14 @@ def _run(check_only: bool, out, sleep: Callable[[float], None], record) -> int:
             rejected += 1
             continue
         text = json.dumps(snapshot, ensure_ascii=False, sort_keys=True)
-        record(True, snapshot["count"], None)  # the trace first; a failed write prints nothing
-        out.write(text + "\n")
-        out.flush()
+        record(True, snapshot["count"], None)  # the trace first: an audit failure prints nothing
+        try:
+            out.write(text + "\n")
+            out.flush()
+        except OSError:
+            # The read succeeded but the snapshot was not delivered: say so in a second line of its own.
+            record(False, snapshot["count"], "stdout", again=True)
+            raise ExportError(EXIT_CONFIG, "stdout", "the snapshot could not be written to stdout") from None
         return EXIT_OK
     raise ExportError(
         EXIT_NO_GRANT, "no_grant", f"no usable grant ({len(grants)} tried, {rejected} refused by Google)"

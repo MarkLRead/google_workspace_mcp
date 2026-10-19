@@ -464,9 +464,11 @@ def test_a_broken_stdout_after_the_trace_leaves_one_record(instance, monkeypatch
         def write(self, s):
             raise OSError("pipe closed")
 
-    with pytest.raises(OSError):
+    with pytest.raises(ec.ExportError) as err:
         ec.run(False, out=Broken())
-    assert len(audit.read_text().splitlines()) == 1
+    assert err.value.tag == "stdout"
+    lines = [json.loads(x) for x in audit.read_text().splitlines()]
+    assert [(x["ok"], x.get("err")) for x in lines] == [(True, None), (False, "stdout")]
 
 
 def test_a_valkey_host_is_refused_even_with_backend_disk(instance, monkeypatch):
